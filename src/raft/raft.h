@@ -20,6 +20,8 @@ public:
     void become_follower(uint64_t term, uint64_t leader);
     void become_candidate();
     void become_leader();
+    void tick();
+    void reset_randomized_election_timeout();
 
     uint64_t get_term() const { return term_; }
     uint64_t get_id() const { return id_; }
@@ -32,6 +34,10 @@ public:
     const std::vector<uint64_t>& get_match_index() const { return match_index_; }
     const std::vector<uint64_t>& get_next_index() const { return next_index_; }
     const std::vector<uint64_t>& get_peers() const { return peers_; }
+    uint32_t get_election_timeout() const { return election_timeout_; }
+    uint32_t get_heartbeat_timeout() const { return heartbeat_timeout_; }
+    uint32_t get_election_elapsed() const { return election_elapsed_; }
+    uint32_t get_randomized_election_timeout() const { return randomized_election_timeout_; }
 
 
 private:
@@ -46,6 +52,16 @@ private:
     std::vector<uint64_t> match_index_;
     std::vector<uint64_t> next_index_;
     std::vector<uint64_t> peers_;
+
+    // Timeout configuration
+    uint32_t election_timeout_;    // Base election timeout in ticks
+    uint32_t heartbeat_timeout_;   // Heartbeat interval in ticks
+
+    // Election timing 
+    uint32_t election_elapsed_;           // Ticks since last reset
+    uint32_t randomized_election_timeout_; // Random timeout for this election
+
+
 
 };
 

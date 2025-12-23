@@ -19,7 +19,25 @@ int main() {
     std::cout << "Node ID: " << raft.get_id() << std::endl;
     std::cout << "Term: " << raft.get_term() << std::endl;
     std::cout << "State: " << (raft.get_state() == kv::State::Follower ? "Follower" : "Other") << std::endl;
+    std::cout << "Initial State: Follower" << std::endl;
+    std::cout << "Election timeout: " << raft.get_randomized_election_timeout() << std::endl;
+    std::cout << "\nSimulating ticks..." << std::endl;
 
+    // Simulate ticks until election timeout
+    for (int i = 0; i < 25; i++) {
+        raft.tick();
+        std::cout << "Tick " << i + 1 
+                  << " - Elapsed: " << raft.get_election_elapsed()
+                  << " - Term: " << raft.get_term()
+                  << " - State: " << (raft.get_state() == kv::State::Follower ? "Follower" : 
+                                     raft.get_state() == kv::State::Candidate ? "Candidate" : "Leader")
+                  << std::endl;
+    }
+
+    std::cout << "\nFinal state: " 
+              << (raft.get_state() == kv::State::Candidate ? "Candidate" : "Other") 
+              << std::endl;
+              
     std::cout << "Raft node initialized successfully!" << std::endl;
 
     return 0;
