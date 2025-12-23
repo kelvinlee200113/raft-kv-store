@@ -5,7 +5,13 @@ project(raft-kv)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Include directories
+include_directories(src)
+
 # Add the main executable
 add_executable(raft-kv
-    main.cpp
+    src/main.cpp
+    src/raft/raft.cpp
 )
+
+

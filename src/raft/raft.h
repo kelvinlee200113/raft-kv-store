@@ -31,7 +31,7 @@ public:
     const std::vector<proto::Entry>& get_log() const { return log_; }
     const std::vector<uint64_t>& get_match_index() const { return match_index_; }
     const std::vector<uint64_t>& get_next_index() const { return next_index_; }
-
+    const std::vector<uint64_t>& get_peers() const { return peers_; }
 
 
 private:
@@ -45,6 +45,7 @@ private:
     std::vector<proto::Entry> log_;
     std::vector<uint64_t> match_index_;
     std::vector<uint64_t> next_index_;
+    std::vector<uint64_t> peers_;
 
 };
 
