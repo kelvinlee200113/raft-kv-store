@@ -1,4 +1,5 @@
 #include "raft/proto.h"
+#include <cstdint>
 #include <cstdlib>
 #include <raft/raft.h>
 
@@ -37,12 +38,17 @@ void Raft::become_leader() {
   state_ = State::Leader;
   lead_ = id_;
 
-  next_index_.resize(peers_.size());
-  match_index_.resize(peers_.size());
+  // Remove stale data
+  progress_.clear();
 
-  for (size_t i = 0; i < peers_.size(); ++i) {
-    next_index_[i] = log_.size() + 1;
-    match_index_[i] = 0;
+  for (uint64_t peer_id : peers_) {
+    if (peer_id == id_) {
+      continue;
+    }
+    Progress progress;
+    progress.next = log_.size() + 1;
+    progress.match = 0;
+    progress_[peer_id] = progress;
   }
 }
 
@@ -162,6 +168,7 @@ std::vector<proto::Message> Raft::read_messages() {
   return msgs;
 }
 
+// Broadcast AppendEntries message (empty for heartbeats)
 void Raft::broadcast_heartbeat() {
   for (uint64_t peer_id : peers_) {
     if (peer_id != id_) {
@@ -209,8 +216,48 @@ proto::Message Raft::handle_append_entries(const proto::Message &msg) {
 
   response.success = true;
   response.term = term_;
+  response.match_index = msg.prev_log_index;
 
   return response;
+}
+
+void Raft::handle_append_entries_response(const proto::Message &msg) {
+  if (state_ != State::Leader) {
+    return;
+  }
+
+  if (term_ > msg.term) {
+    return;
+  }
+
+  if (term_ < msg.term) {
+    become_follower(msg.term, 0);
+  }
+
+  if (msg.success) {
+    progress_[msg.from].match = msg.match_index;
+    progress_[msg.from].next = progress_[msg.from].match + 1;
+
+  } else {
+    // Retry with lower index
+    progress_[msg.from].next--;
+    broadcast_heartbeat();
+  }
+}
+
+void Raft::propose(const std::vector<uint8_t> &data) {
+  if (state_ != State::Leader) {
+    return;
+  }
+
+  proto::Entry entry;
+  entry.type = proto::EntryNormal;
+  entry.data = data;
+  entry.index = log_.size() + 1;
+  entry.term = term_;
+
+  log_.push_back(entry);
+  broadcast_heartbeat();
 }
 
 } // namespace kv

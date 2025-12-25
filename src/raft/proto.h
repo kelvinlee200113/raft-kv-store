@@ -31,21 +31,29 @@ struct Message {
   uint64_t from;
   uint64_t to;
   uint64_t term;
-  uint64_t last_log_index;
-  uint64_t last_log_term;
+
+  // RequestVote Request fields
+  uint64_t last_log_index; // For RequestVote: candidate's last log index
+  uint64_t last_log_term; // For RequestVote: term of candidate's last log entry
+
+  // RequestVote Response fields
   bool vote_granted;
 
   // AppendEntries fields
-  uint64_t prev_log_index;
-  uint64_t prev_log_term;
+  uint64_t prev_log_index; // For AppendEntries: index of log entry immediately
+                           // before new ones
+  uint64_t prev_log_term;  // For AppendEntries: term of prev_log_index entry
   std::vector<Entry> entries;
   uint64_t leader_commit;
+
+  // AppendEntries Response fields
   bool success;
+  uint64_t match_index; // index the follower successfully matched
 
   Message()
       : type(MsgRequestVote), from(0), to(0), term(0), last_log_index(0),
         last_log_term(0), vote_granted(false), prev_log_index(0),
-        prev_log_term(0), leader_commit(0), success(false) {}
+        prev_log_term(0), leader_commit(0), success(false), match_index(0) {}
 };
 
 } // namespace proto

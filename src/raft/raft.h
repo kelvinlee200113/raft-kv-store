@@ -10,6 +10,15 @@ namespace kv {
 // Raft node states
 enum class State { Follower, Candidate, Leader };
 
+// Progress tracks replication progress for each follower
+struct Progress {
+  uint64_t match; // Highest log index known to be replicated on this follower
+  uint64_t next;  // Next log index to send to this follower
+
+  // Logs are 1-indexed
+  Progress() : match(0), next(1) {}
+};
+
 class Raft {
 public:
   explicit Raft(const Config &config);
@@ -38,6 +47,10 @@ public:
 
   proto::Message handle_append_entries(const proto::Message &msg);
 
+  void handle_append_entries_response(const proto::Message &msg);
+
+  void propose(const std::vector<uint8_t> &data);
+
   uint64_t get_term() const { return term_; }
   uint64_t get_id() const { return id_; }
   uint64_t get_leader() const { return lead_; }
@@ -46,8 +59,9 @@ public:
   uint64_t get_last_applied() const { return last_applied_; }
   State get_state() const { return state_; }
   const std::vector<proto::Entry> &get_log() const { return log_; }
-  const std::vector<uint64_t> &get_match_index() const { return match_index_; }
-  const std::vector<uint64_t> &get_next_index() const { return next_index_; }
+  const std::unordered_map<uint64_t, Progress> &get_progress() const {
+    return progress_;
+  }
   const std::vector<uint64_t> &get_peers() const { return peers_; }
   uint32_t get_election_timeout() const { return election_timeout_; }
   uint32_t get_heartbeat_timeout() const { return heartbeat_timeout_; }
@@ -66,8 +80,7 @@ private:
   uint64_t last_applied_;
   State state_;
   std::vector<proto::Entry> log_;
-  std::vector<uint64_t> match_index_;
-  std::vector<uint64_t> next_index_;
+  std::unordered_map<uint64_t, Progress> progress_;
   std::vector<uint64_t> peers_;
 
   // Timeout configuration
