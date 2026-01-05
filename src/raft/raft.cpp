@@ -342,4 +342,11 @@ std::vector<proto::Entry> Raft::get_entries_to_apply() {
   return result;
 }
 
+void Raft::advance(uint64_t index) {
+  if (index > commit_index_ || index <= last_applied_) {
+    return;
+  }
+  last_applied_ = index;
+}
+
 } // namespace kv

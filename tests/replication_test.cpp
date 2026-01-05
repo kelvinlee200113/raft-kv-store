@@ -355,6 +355,53 @@ TEST_F(ReplicationTest, GetEntriesToApply) {
   EXPECT_EQ(entries.size(), 3);
 }
 
+// Test 7: Advance - update last_applied after applying entries
+TEST_F(ReplicationTest, Advance) {
+  make_node1_leader();
+
+  // Propose and commit 5 entries
+  for (int i = 1; i <= 5; i++) {
+    node1_->propose({static_cast<uint8_t>(i)});
+  }
+
+  node1_->broadcast_heartbeat();
+  deliver_messages();  // Replicate to followers
+  deliver_messages();  // Deliver responses back to leader
+
+  EXPECT_EQ(node1_->get_commit_index(), 5);
+  EXPECT_EQ(node1_->get_last_applied(), 0);  // Not applied yet
+
+  // Get entries to apply
+  auto entries = node1_->get_entries_to_apply();
+  EXPECT_EQ(entries.size(), 5);
+
+  // Apply first 3 entries
+  node1_->advance(3);
+  EXPECT_EQ(node1_->get_last_applied(), 3);
+
+  // Now get_entries_to_apply should return only remaining 2
+  entries = node1_->get_entries_to_apply();
+  EXPECT_EQ(entries.size(), 2);
+  EXPECT_EQ(entries[0].index, 4);
+  EXPECT_EQ(entries[1].index, 5);
+
+  // Apply remaining entries
+  node1_->advance(5);
+  EXPECT_EQ(node1_->get_last_applied(), 5);
+
+  // No more entries to apply
+  entries = node1_->get_entries_to_apply();
+  EXPECT_EQ(entries.size(), 0);
+
+  // Test invariant: Can't go backward
+  node1_->advance(3);
+  EXPECT_EQ(node1_->get_last_applied(), 5);  // Should stay at 5
+
+  // Test invariant: Can't advance beyond commit_index
+  node1_->advance(10);
+  EXPECT_EQ(node1_->get_last_applied(), 5);  // Should stay at 5
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
