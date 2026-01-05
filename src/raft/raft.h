@@ -51,6 +51,8 @@ public:
 
   void propose(const std::vector<uint8_t> &data);
 
+  std::vector<proto::Entry> get_entries_to_apply();
+
   uint64_t get_term() const { return term_; }
   uint64_t get_id() const { return id_; }
   uint64_t get_leader() const { return lead_; }

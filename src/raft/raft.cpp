@@ -260,7 +260,8 @@ proto::Message Raft::handle_append_entries(const proto::Message &msg) {
 
   // Update commit index based on leader's commit
   if (msg.leader_commit > commit_index_) {
-    commit_index_ = std::min(msg.leader_commit, static_cast<uint64_t>(log_.size()));
+    commit_index_ =
+        std::min(msg.leader_commit, static_cast<uint64_t>(log_.size()));
   }
 
   return response;
@@ -325,6 +326,20 @@ void Raft::propose(const std::vector<uint8_t> &data) {
 
   log_.push_back(entry);
   broadcast_heartbeat();
+}
+
+std::vector<proto::Entry> Raft::get_entries_to_apply() {
+  std::vector<proto::Entry> result;
+
+  if (last_applied_ >= commit_index_) {
+    return result;
+  }
+
+  for (uint64_t i = last_applied_ + 1; i <= commit_index_; ++i) {
+    result.push_back(log_[i - 1]);
+  }
+
+  return result;
 }
 
 } // namespace kv

@@ -36,10 +36,13 @@ protected:
   }
 
   // Helper: Get node by ID
-  Raft* get_node(uint64_t id) {
-    if (id == 1) return node1_.get();
-    if (id == 2) return node2_.get();
-    if (id == 3) return node3_.get();
+  Raft *get_node(uint64_t id) {
+    if (id == 1)
+      return node1_.get();
+    if (id == 2)
+      return node2_.get();
+    if (id == 3)
+      return node3_.get();
     return nullptr;
   }
 
@@ -57,9 +60,10 @@ protected:
     all_msgs.insert(all_msgs.end(), msgs3.begin(), msgs3.end());
 
     // Deliver each message to its recipient
-    for (const auto& msg : all_msgs) {
-      Raft* recipient = get_node(msg.to);
-      if (!recipient) continue;
+    for (const auto &msg : all_msgs) {
+      Raft *recipient = get_node(msg.to);
+      if (!recipient)
+        continue;
 
       if (msg.type == proto::MsgRequestVote) {
         auto response = recipient->handle_request_vote(msg);
@@ -131,7 +135,7 @@ TEST_F(ReplicationTest, BasicReplication) {
   EXPECT_EQ(node1_->get_commit_index(), 1);
 
   // Check Progress tracking
-  auto& progress = node1_->get_progress();
+  auto &progress = node1_->get_progress();
   EXPECT_EQ(progress.at(2).match, 1);
   EXPECT_EQ(progress.at(2).next, 2);
   EXPECT_EQ(progress.at(3).match, 1);
@@ -168,12 +172,13 @@ TEST_F(ReplicationTest, MultipleEntries) {
   EXPECT_EQ(node1_->get_commit_index(), 3);
 
   // Check Progress
-  auto& progress = node1_->get_progress();
+  auto &progress = node1_->get_progress();
   EXPECT_EQ(progress.at(2).match, 3);
   EXPECT_EQ(progress.at(3).match, 3);
 }
 
-// Test 3: Follower Commit Update - follower updates commit_index from leader_commit
+// Test 3: Follower Commit Update - follower updates commit_index from
+// leader_commit
 TEST_F(ReplicationTest, FollowerCommitUpdate) {
   make_node1_leader();
 
@@ -213,7 +218,7 @@ TEST_F(ReplicationTest, ConflictResolution) {
 
   // Deliver to node2 only (node3 doesn't get it)
   auto msgs = node1_->read_messages();
-  for (const auto& msg : msgs) {
+  for (const auto &msg : msgs) {
     if (msg.to == 2 && msg.type == proto::MsgAppendEntries) {
       auto response = node2_->handle_append_entries(msg);
       node2_->send(response);
@@ -233,7 +238,8 @@ TEST_F(ReplicationTest, ConflictResolution) {
   conflict_entry.type = proto::EntryNormal;
 
   // Manually inject conflicting entry into node3
-  // We need to simulate this by having node3 receive AppendEntries from a fake term 2 leader
+  // We need to simulate this by having node3 receive AppendEntries from a fake
+  // term 2 leader
   node3_->become_follower(2, 99); // Pretend there was a term 2 leader
 
   proto::Message fake_append;
@@ -286,7 +292,7 @@ TEST_F(ReplicationTest, PartialReplication) {
 
   // Only deliver to node2 (not node3)
   auto msgs = node1_->read_messages();
-  for (const auto& msg : msgs) {
+  for (const auto &msg : msgs) {
     if (msg.to == 2 && msg.type == proto::MsgAppendEntries) {
       auto response = node2_->handle_append_entries(msg);
       node1_->handle_append_entries_response(response);
@@ -301,14 +307,55 @@ TEST_F(ReplicationTest, PartialReplication) {
 
   // Leader should NOT commit (only 2 out of 3 nodes - not a majority)
   // Note: In a 3-node cluster, we need 2 nodes (including leader) to commit
-  // Leader itself counts as 1, node2 counts as 1 = 2 total, which IS a majority!
-  // So this should actually commit.
+  // Leader itself counts as 1, node2 counts as 1 = 2 total, which IS a
+  // majority! So this should actually commit.
   EXPECT_EQ(node1_->get_commit_index(), 1);
 
   // Let's test with a 5-node cluster instead for true partial replication
 }
 
-int main(int argc, char** argv) {
+// Test 6: Get Entries To Apply
+TEST_F(ReplicationTest, GetEntriesToApply) {
+  make_node1_leader();
+
+  // Leader proposes 3 entries
+  node1_->propose({1, 2, 3});
+  node1_->propose({4, 5, 6});
+  node1_->propose({7, 8, 9});
+
+  node1_->broadcast_heartbeat();
+
+  // Replicate to followers
+  auto msgs = node1_->read_messages();
+  for (const auto &msg : msgs) {
+    if (msg.type == proto::MsgAppendEntries) {
+      if (msg.to == 2) {
+        auto response = node2_->handle_append_entries(msg);
+        node1_->handle_append_entries_response(response);
+      }
+      if (msg.to == 3) {
+        auto response = node3_->handle_append_entries(msg);
+        node1_->handle_append_entries_response(response);
+      }
+    }
+  }
+
+  // All 3 entries should be committed now
+  EXPECT_EQ(node1_->get_commit_index(), 3);
+
+  // Initially, last_applied = 0, so we should get all 3 entries
+  auto entries = node1_->get_entries_to_apply();
+  EXPECT_EQ(entries.size(), 3);
+  EXPECT_EQ(entries[0].index, 1);
+  EXPECT_EQ(entries[1].index, 2);
+  EXPECT_EQ(entries[2].index, 3);
+
+  // If we call again without updating last_applied_, should get same entries
+  entries = node1_->get_entries_to_apply();
+  EXPECT_EQ(entries.size(), 3);
+}
+
+int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
