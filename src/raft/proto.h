@@ -1,4 +1,5 @@
 #pragma once
+#include <msgpack.hpp>
 #include <stdint.h>
 #include <vector>
 
@@ -17,6 +18,8 @@ struct Entry {
   std::vector<uint8_t> data;
 
   Entry() : type(EntryNormal), term(0), index(0) {}
+
+  MSGPACK_DEFINE(type, term, index, data);
 };
 
 typedef uint8_t MessageType;
@@ -54,6 +57,10 @@ struct Message {
       : type(MsgRequestVote), from(0), to(0), term(0), last_log_index(0),
         last_log_term(0), vote_granted(false), prev_log_index(0),
         prev_log_term(0), leader_commit(0), success(false), match_index(0) {}
+
+  MSGPACK_DEFINE(type, from, to, term, last_log_index, last_log_term,
+                 vote_granted, prev_log_index, prev_log_term, entries,
+                 leader_commit, success, match_index);
 };
 
 typedef std::shared_ptr<Message> MessagePtr;

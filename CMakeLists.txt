@@ -21,6 +21,8 @@ add_library(raft_lib STATIC
     src/raft/raft.cpp
     src/server/kv_store.cpp
     src/common/bytebuffer.cpp
+    src/transport/peer.cpp
+    src/transport/server.cpp
 )
 
 # Add the main executable
@@ -52,5 +54,9 @@ add_test(NAME KVStoreTest COMMAND kv_store_test)
 add_executable(transport_proto_test tests/transport_proto_test.cpp)
 target_link_libraries(transport_proto_test raft_lib GTest::gtest GTest::gtest_main)
 add_test(NAME TransportProtoTest COMMAND transport_proto_test)
+
+add_executable(network_test tests/network_test.cpp)
+target_link_libraries(network_test raft_lib GTest::gtest GTest::gtest_main)
+add_test(NAME NetworkTest COMMAND network_test)
 
 

@@ -1,10 +1,10 @@
 #include <boost/asio.hpp>
+#include <common/bytebuffer.h>
 #include <iostream>
 #include <msgpack.hpp>
 #include <string>
 #include <transport/peer.h>
 #include <transport/proto.h>
-#include <vector>
 
 namespace kv {
 
@@ -22,27 +22,70 @@ public:
 
   // Send data over the connection
   void send(uint8_t transport_type, const uint8_t *data, uint32_t len) {
+    uint32_t remaining = buffer_.readable_bytes();
+
+    // Create Transport header
     TransportMeta meta;
     meta.type = transport_type;
-    meta.len = htonl(len);
+    meta.len = htonl(len); // Convert to network byte order
+    assert(sizeof(TransportMeta) == 5);
+    buffer_.put((const uint8_t *)&meta, sizeof(TransportMeta));
+    buffer_.put(data, len);
+    assert(remaining + sizeof(TransportMeta) + len == buffer_.readable_bytes());
+
+    // If connected and buffer was empty, trigger async write
+    if (connected_ && remaining == 0) {
+      start_write();
+    }
   }
 
   // Start async connection to remote peer
   void start_connect() {
-    // TODO: We'll implement this next
+    socket_.async_connect(endpoint_, [this](const boost::system::error_code &err) {
+      if (err) {
+        std::cerr << "Connect error: " << err.message() << std::endl;
+        this->close_session();
+        return;
+      }
+      this->connected_ = true;
+      std::cout << "Connected to peer " << this->peer_id_ << std::endl;
+
+      if (this->buffer_.readable()) {
+        this->start_write();
+      }
+    });
   }
 
-  // Close the session
-  void close_session() {
-    // TODO: We'll implement this next
-  }
+  // Close the session (defined later after PeerImpl is complete)
+  void close_session();
 
 private:
+  // Async write buffered data to socket
+  void start_write() {
+    if (!buffer_.readable()) {
+      return;
+    }
+
+    uint32_t remaining = buffer_.readable_bytes();
+    auto buffer = boost::asio::buffer(buffer_.reader(), remaining);
+    auto handler = [this](const boost::system::error_code &error,
+                          std::size_t bytes) {
+      if (error || bytes == 0) {
+        std::cerr << "Send error: " << error.message() << std::endl;
+        this->close_session();
+        return;
+      }
+      this->buffer_.read_bytes(bytes);
+      this->start_write(); // Recursively write remaining data
+    };
+    boost::asio::async_write(socket_, buffer, handler);
+  }
+
   boost::asio::ip::tcp::socket socket_;
   boost::asio::ip::tcp::endpoint endpoint_;
   PeerImpl *peer_;
   uint64_t peer_id_;
-  std::vector<uint8_t> buffer_;
+  ByteBuffer buffer_;
   bool connected_;
 };
 
@@ -88,6 +131,7 @@ public:
   }
 
 private:
+  friend class ClientSession;  // Allow ClientSession to access session_
   void do_send_data(uint8_t type, const uint8_t *data, uint32_t len);
 
   uint64_t peer_id_;
@@ -105,6 +149,11 @@ void PeerImpl::do_send_data(uint8_t type, const uint8_t *data, uint32_t len) {
   } else {
     session_->send(type, data, len);
   }
+}
+
+// ClientSession::close_session implementation (after PeerImpl is complete)
+void ClientSession::close_session() {
+  peer_->session_ = nullptr;
 }
 
 std::shared_ptr<Peer>
