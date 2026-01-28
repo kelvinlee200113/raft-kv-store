@@ -5,6 +5,9 @@
 
 namespace kv {
 
+// Forward declaration
+class Raft;
+
 // Server listens for incoming TCP connections and creates ServerSession
 // instances to handle them
 class Server {
@@ -19,7 +22,8 @@ public:
 
   // Factory method
   static std::shared_ptr<Server> create(boost::asio::io_context &io_ctx,
-                                        const std::string &host);
+                                        const std::string &host,
+                                        Raft* raft);
 };
 
 typedef std::shared_ptr<Server> ServerPtr;

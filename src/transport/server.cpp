@@ -1,6 +1,7 @@
 #include <boost/asio.hpp>
 #include <iostream>
 #include <msgpack.hpp>
+#include <raft/raft.h>
 #include <transport/proto.h>
 #include <transport/server.h>
 
@@ -14,7 +15,8 @@ class ServerImpl;
 // callbacks
 class ServerSession : public std::enable_shared_from_this<ServerSession> {
 public:
-  ServerSession(boost::asio::io_context &io_ctx) : socket_(io_ctx) {}
+  ServerSession(boost::asio::io_context &io_ctx, Raft* raft)
+      : socket_(io_ctx), raft_(raft) {}
 
   ~ServerSession() {}
 
@@ -90,10 +92,40 @@ public:
         return;
       }
 
-      // TODO: Pass message to Raft for processing
-      std::cout << "Received message: type=" << (int)msg->type
-                << " from=" << msg->from << " to=" << msg->to
-                << " term=" << msg->term << std::endl;
+      // Route message to Raft based on type
+      proto::Message response;
+      switch (msg->type) {
+      case proto::MsgRequestVote:
+        std::cout << "Received RequestVote from " << msg->from
+                  << " term=" << msg->term << std::endl;
+        response = raft_->handle_request_vote(*msg);
+        // Response is queued in raft's msgs_ (retrieved via read_messages())
+        break;
+
+      case proto::MsgAppendEntries:
+        std::cout << "Received AppendEntries from " << msg->from
+                  << " term=" << msg->term << " entries=" << msg->entries.size()
+                  << std::endl;
+        response = raft_->handle_append_entries(*msg);
+        // Response is queued in raft's msgs_
+        break;
+
+      case proto::MsgRequestVoteResponse:
+        std::cout << "Received RequestVoteResponse from " << msg->from
+                  << " granted=" << msg->vote_granted << std::endl;
+        raft_->handle_request_vote_response(*msg);
+        break;
+
+      case proto::MsgAppendEntriesResponse:
+        std::cout << "Received AppendEntriesResponse from " << msg->from
+                  << " success=" << msg->success << std::endl;
+        raft_->handle_append_entries_response(*msg);
+        break;
+
+      default:
+        std::cerr << "Unknown message type: " << (int)msg->type << std::endl;
+        break;
+      }
       break;
     }
     default:
@@ -108,6 +140,7 @@ public:
   boost::asio::ip::tcp::socket socket_; // Public for acceptor
 
 private:
+  Raft* raft_;
   TransportMeta meta_;
   std::vector<uint8_t> buffer_;
 };
@@ -117,8 +150,8 @@ typedef std::shared_ptr<ServerSession> ServerSessionPtr;
 // ServerImpl implements the Server interface
 class ServerImpl : public Server {
 public:
-  ServerImpl(boost::asio::io_context &io_ctx, const std::string &host)
-      : io_ctx_(io_ctx), acceptor_(io_ctx) {
+  ServerImpl(boost::asio::io_context &io_ctx, const std::string &host, Raft* raft)
+      : io_ctx_(io_ctx), acceptor_(io_ctx), raft_(raft) {
 
     // Parse "127.0.0.1:5001" into IP and port
     size_t colon_pos = host.find(':');
@@ -148,7 +181,7 @@ public:
 
   void start() override {
     // Create new session for incoming connection
-    ServerSessionPtr session = std::make_shared<ServerSession>(io_ctx_);
+    ServerSessionPtr session = std::make_shared<ServerSession>(io_ctx_, raft_);
 
     // Async accept - callback fires when client connects
     acceptor_.async_accept(
@@ -175,11 +208,13 @@ public:
 private:
   boost::asio::io_context &io_ctx_;
   boost::asio::ip::tcp::acceptor acceptor_;
+  Raft* raft_;
 };
 
 std::shared_ptr<Server> Server::create(boost::asio::io_context &io_ctx,
-                                       const std::string &host) {
-  return std::make_shared<ServerImpl>(io_ctx, host);
+                                       const std::string &host,
+                                       Raft* raft) {
+  return std::make_shared<ServerImpl>(io_ctx, host, raft);
 }
 
 } // namespace kv

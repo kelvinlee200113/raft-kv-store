@@ -1,7 +1,8 @@
 #include <boost/asio.hpp>
 #include <gtest/gtest.h>
-#include <iostream>
+#include <raft/config.h>
 #include <raft/proto.h>
+#include <raft/raft.h>
 #include <thread>
 #include <transport/peer.h>
 #include <transport/server.h>
@@ -12,8 +13,16 @@ using namespace kv;
 TEST(NetworkTest, SendMessageOverTCP) {
   boost::asio::io_context io_ctx;
 
+  // Create Raft instance for server
+  kv::Config config;
+  config.id = 2;
+  config.peers = {1, 2, 3};
+  config.election_tick = 10;
+  config.heartbeat_tick = 1;
+  kv::Raft raft(config);
+
   // Create server listening on 127.0.0.1:9001
-  ServerPtr server = Server::create(io_ctx, "127.0.0.1:9001");
+  ServerPtr server = Server::create(io_ctx, "127.0.0.1:9001", &raft);
   server->start();
 
   // Create peer that will connect to 127.0.0.1:9001
