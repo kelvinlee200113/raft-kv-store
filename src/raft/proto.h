@@ -27,6 +27,8 @@ const MessageType MsgRequestVote = 0;
 const MessageType MsgRequestVoteResponse = 1;
 const MessageType MsgAppendEntries = 2;
 const MessageType MsgAppendEntriesResponse = 3;
+const MessageType MsgPreVote = 4;
+const MessageType MsgPreVoteResponse = 5;
 
 // Message for RPC communication between nodes
 struct Message {

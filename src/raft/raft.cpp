@@ -28,11 +28,20 @@ void Raft::become_follower(uint64_t term, uint64_t leader) {
   reset_randomized_election_timeout();
 }
 
+void Raft::become_pre_candidate() {
+  state_ = State::PreCandidate;
+  // Don't increment term in PreVote!
+  lead_ = 0;
+  pre_votes_.clear();
+  reset_randomized_election_timeout();
+}
+
 void Raft::become_candidate() {
   state_ = State::Candidate;
   term_++;
   lead_ = 0;
   voted_for_ = id_;
+  votes_.clear();
   reset_randomized_election_timeout();
 }
 
@@ -74,10 +83,18 @@ void Raft::tick() {
     if (election_elapsed_ >= randomized_election_timeout_) {
       election_elapsed_ = 0;
 
-      // Only followers and candidates can start elections
-      if (state_ == State::Follower || state_ == State::Candidate) {
-        become_candidate();
-        campaign(); // Send RequestVote messages to all peers
+      // Followers start with PreVote, PreCandidates and Candidates re-campaign
+      if (state_ == State::Follower) {
+        become_pre_candidate();
+        pre_campaign(); // Send PreVote messages to all peers
+      } else if (state_ == State::PreCandidate) {
+        // PreVote failed, retry
+        become_pre_candidate();
+        pre_campaign();
+      } else if (state_ == State::Candidate) {
+        // Real vote failed, go back to PreVote
+        become_pre_candidate();
+        pre_campaign();
       }
     }
   }
@@ -148,6 +165,98 @@ void Raft::handle_request_vote_response(const proto::Message &msg) {
   // If majority, become leader
   if (total_votes > peers_.size() / 2) {
     become_leader();
+  }
+}
+
+// Handle PreVote request (like RequestVote but doesn't increment term)
+proto::Message Raft::handle_pre_vote(const proto::Message &msg) {
+  proto::Message response;
+  response.type = proto::MsgPreVoteResponse;
+  response.from = id_;
+  response.to = msg.from;
+  response.vote_granted = false;
+
+  // Reject if we have a leader and it's still sending heartbeats
+  // (election_elapsed_ is low)
+  if (lead_ != 0 && election_elapsed_ < election_timeout_) {
+    response.term = term_;
+    return response; // vote_granted = false
+  }
+
+  // Grant pre-vote if candidate's log is at least as up-to-date as ours
+  // Same logic as RequestVote
+  bool log_ok = false;
+  if (log_.empty()) {
+    log_ok = true; // We have no log, anyone is ok
+  } else {
+    uint64_t our_last_index = log_.size();
+    uint64_t our_last_term = log_[our_last_index - 1].term;
+
+    if (msg.last_log_term > our_last_term) {
+      log_ok = true; // Candidate's last term is newer
+    } else if (msg.last_log_term == our_last_term &&
+               msg.last_log_index >= our_last_index) {
+      log_ok = true; // Same term, candidate's log is at least as long
+    }
+  }
+
+  if (log_ok) {
+    response.vote_granted = true;
+  }
+
+  response.term = term_;
+  return response;
+}
+
+// Handle PreVote response
+void Raft::handle_pre_vote_response(const proto::Message &msg) {
+  // Ensure we are still pre-candidate
+  if (state_ != State::PreCandidate) {
+    return;
+  }
+
+  // Record granted pre-vote
+  if (msg.vote_granted) {
+    pre_votes_[msg.from] = true;
+  }
+
+  // Count total pre-votes
+  uint64_t total_pre_votes = 0;
+  for (const auto &vote : pre_votes_) {
+    if (vote.second) {
+      total_pre_votes++;
+    }
+  }
+
+  // If majority, transition to real candidate and start real election
+  if (total_pre_votes > peers_.size() / 2) {
+    become_candidate();
+    campaign();
+  }
+}
+
+// PreCandidate pre-campaigning for itself
+void Raft::pre_campaign() {
+  // Record pre-vote for self
+  pre_votes_[id_] = true;
+  for (uint64_t peer_id : peers_) {
+    if (peer_id != id_) {
+      // Create PreVote message (using CURRENT term, not term+1!)
+      proto::Message msg;
+      msg.type = proto::MsgPreVote;
+      msg.from = id_;
+      msg.to = peer_id;
+      msg.term = term_; // Current term, not incremented!
+      if (log_.empty()) {
+        msg.last_log_index = 0;
+        msg.last_log_term = 0;
+      } else {
+        proto::Entry last_entry = log_[log_.size() - 1];
+        msg.last_log_index = last_entry.index;
+        msg.last_log_term = last_entry.term;
+      }
+      msgs_.push_back(msg);
+    }
   }
 }
 

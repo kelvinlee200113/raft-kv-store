@@ -8,7 +8,7 @@
 namespace kv {
 
 // Raft node states
-enum class State { Follower, Candidate, Leader };
+enum class State { Follower, PreCandidate, Candidate, Leader };
 
 // Progress tracks replication progress for each follower
 struct Progress {
@@ -25,6 +25,8 @@ public:
 
   void become_follower(uint64_t term, uint64_t leader);
 
+  void become_pre_candidate();
+
   void become_candidate();
 
   void become_leader();
@@ -38,6 +40,12 @@ public:
   void handle_request_vote_response(const proto::Message &msg);
 
   void campaign();
+
+  void pre_campaign();
+
+  proto::Message handle_pre_vote(const proto::Message &msg);
+
+  void handle_pre_vote_response(const proto::Message &msg);
 
   void send(proto::Message msg);
 
@@ -106,6 +114,8 @@ private:
   // Voting
   std::unordered_map<uint64_t, bool>
       votes_; // Track votes received (node_id -> granted)
+  std::unordered_map<uint64_t, bool>
+      pre_votes_; // Track pre-votes received (node_id -> granted)
 
   // ReadIndex state
   bool read_index_pending_;               // Is there a pending ReadIndex request?

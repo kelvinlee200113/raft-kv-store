@@ -113,6 +113,21 @@ public:
         }
         break;
 
+      case proto::MsgPreVote:
+        std::cout << "Received PreVote from " << msg->from
+                  << " term=" << msg->term << std::endl;
+        {
+          proto::Message response = raft_->handle_pre_vote(*msg);
+          raft_->send(response); // Queue response to be sent
+        }
+        break;
+
+      case proto::MsgPreVoteResponse:
+        std::cout << "Received PreVoteResponse from " << msg->from
+                  << " granted=" << msg->vote_granted << std::endl;
+        raft_->handle_pre_vote_response(*msg);
+        break;
+
       case proto::MsgRequestVoteResponse:
         std::cout << "Received RequestVoteResponse from " << msg->from
                   << " granted=" << msg->vote_granted << std::endl;
