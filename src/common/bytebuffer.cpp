@@ -1,55 +1,70 @@
 #include <common/bytebuffer.h>
-#include <cstring>
+
+#include <stdexcept>
 
 namespace kv {
 
-// OS page size is 4096 bytes
-static const uint32_t MIN_BUFFERING = 4096;
-
-ByteBuffer::ByteBuffer() : reader_(0), writer_(0), buff_(MIN_BUFFERING) {}
-
-// Append data to buffer (grows if needed)
-void ByteBuffer::put(const uint8_t *data, uint32_t len) {
-  uint32_t available = buff_.size() - writer_;
-  if (available < len) {
-    buff_.resize(2 * buff_.size() + len);
+ByteBuffer::ByteBuffer(std::size_t max_size) : max_size_(max_size) {
+  if (max_size_ == 0) {
+    throw std::invalid_argument("byte buffer limit must be positive");
   }
-  memcpy(buff_.data() + writer_, data, len);
-  writer_ += len;
 }
 
-// Mark data as consumed/read
-void ByteBuffer::read_bytes(uint32_t len) {
-  assert(readable_bytes() >= len);
-  reader_ += len;
-  may_shrink_to_fit();
-}
-
-// Gets pointer to start of unread data
-const uint8_t *ByteBuffer::reader() const { return buff_.data() + reader_; }
-
-// Check if there's data to read
-bool ByteBuffer::readable() const { return writer_ > reader_; }
-
-// How many bytes available to read
-uint32_t ByteBuffer::readable_bytes() const {
-  assert(writer_ >= reader_);
-  return writer_ - reader_;
-}
-
-// Full reset to initial state
-void ByteBuffer::reset() {
-  buff_.resize(MIN_BUFFERING);
-  writer_ = 0;
-  reader_ = 0;
-  buff_.shrink_to_fit();
-}
-
-void ByteBuffer::may_shrink_to_fit() {
-  if (writer_ == reader_) {
-    writer_ = 0;
-    reader_ = 0;
+void ByteBuffer::append(const std::uint8_t *bytes, std::size_t size) {
+  if (size == 0) {
+    return;
   }
+  if (bytes == nullptr) {
+    throw std::invalid_argument("cannot append a null byte range");
+  }
+  if (size > max_size_ - readable_bytes()) {
+    throw std::length_error("byte buffer limit exceeded");
+  }
+
+  compact();
+  bytes_.insert(bytes_.end(), bytes, bytes + size);
+}
+
+void ByteBuffer::append(const void *bytes, std::size_t size) {
+  append(static_cast<const std::uint8_t *>(bytes), size);
+}
+
+void ByteBuffer::consume(std::size_t size) {
+  if (size > readable_bytes()) {
+    throw std::out_of_range("cannot consume beyond readable bytes");
+  }
+
+  read_offset_ += size;
+  if (read_offset_ == bytes_.size()) {
+    clear();
+  }
+}
+
+void ByteBuffer::clear() noexcept {
+  bytes_.clear();
+  read_offset_ = 0;
+}
+
+const std::uint8_t *ByteBuffer::data() const noexcept {
+  return empty() ? nullptr : bytes_.data() + read_offset_;
+}
+
+std::uint8_t *ByteBuffer::data() noexcept {
+  return empty() ? nullptr : bytes_.data() + read_offset_;
+}
+
+std::size_t ByteBuffer::readable_bytes() const noexcept {
+  return bytes_.size() - read_offset_;
+}
+
+void ByteBuffer::compact() {
+  if (read_offset_ == 0) {
+    return;
+  }
+
+  bytes_.erase(bytes_.begin(), bytes_.begin() +
+                                   static_cast<std::ptrdiff_t>(read_offset_));
+  read_offset_ = 0;
 }
 
 } // namespace kv

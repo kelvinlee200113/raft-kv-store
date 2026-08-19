@@ -52,14 +52,16 @@ struct SnapshotMeta {
   uint64_t index;                // Last log index included in this snapshot
   uint64_t term;                 // Term of that log entry
   std::vector<uint8_t> state;   // Serialized state machine
+  bool discard_suffix;          // InstallSnapshot resets the prior local log
 
-  SnapshotMeta() : index(0), term(0) {}
-  SnapshotMeta(uint64_t i, uint64_t t, std::vector<uint8_t> s)
-      : index(i), term(t), state(std::move(s)) {}
+  SnapshotMeta() : index(0), term(0), discard_suffix(false) {}
+  SnapshotMeta(uint64_t i, uint64_t t, std::vector<uint8_t> s,
+               bool discard = false)
+      : index(i), term(t), state(std::move(s)), discard_suffix(discard) {}
 
   bool is_empty() const { return index == 0 && term == 0 && state.empty(); }
 
-  MSGPACK_DEFINE(index, term, state);
+  MSGPACK_DEFINE(index, term, state, discard_suffix);
 };
 
 // WAL record header (8 bytes)
@@ -94,10 +96,15 @@ struct RecordHeader {
     hdr.type = data[0];
 
     // Length (3 bytes, little-endian)
-    hdr.len = data[1] | (data[2] << 8) | (data[3] << 16);
+    hdr.len = static_cast<uint32_t>(data[1]) |
+              (static_cast<uint32_t>(data[2]) << 8U) |
+              (static_cast<uint32_t>(data[3]) << 16U);
 
     // CRC (4 bytes, little-endian)
-    hdr.crc = data[4] | (data[5] << 8) | (data[6] << 16) | (data[7] << 24);
+    hdr.crc = static_cast<uint32_t>(data[4]) |
+              (static_cast<uint32_t>(data[5]) << 8U) |
+              (static_cast<uint32_t>(data[6]) << 16U) |
+              (static_cast<uint32_t>(data[7]) << 24U);
 
     return hdr;
   }

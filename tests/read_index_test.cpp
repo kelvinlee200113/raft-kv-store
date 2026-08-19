@@ -3,6 +3,37 @@
 #include <raft/proto.h>
 #include <raft/raft.h>
 
+namespace {
+
+kv::proto::Message elect_leader(kv::Raft &raft) {
+  raft.become_candidate();
+  raft.campaign();
+  raft.read_messages();
+
+  kv::proto::Message vote;
+  vote.type = kv::proto::MsgRequestVoteResponse;
+  vote.from = 2;
+  vote.to = 1;
+  vote.term = 1;
+  vote.vote_granted = true;
+  raft.handle_request_vote_response(vote);
+  EXPECT_EQ(raft.get_state(), kv::State::Leader);
+  raft.read_messages();
+  return vote;
+}
+
+kv::proto::Message successful_response(const kv::proto::Message &request) {
+  kv::proto::Message response;
+  response.type = kv::proto::MsgAppendEntriesResponse;
+  response.from = request.to;
+  response.to = request.from;
+  response.term = request.term;
+  response.success = true;
+  response.match_index = request.prev_log_index + request.entries.size();
+  response.read_context = request.read_context;
+  return response;
+}
+
 class ReadIndexTest : public ::testing::Test {
 protected:
   void SetUp() override {
@@ -15,204 +46,172 @@ protected:
   kv::Config config;
 };
 
-// Test: ReadIndex returns 0 for non-leaders
-TEST_F(ReadIndexTest, NonLeaderReturnsZero) {
+TEST_F(ReadIndexTest, FollowerCannotStartReadIndex) {
   kv::Raft raft(config);
-
-  // Follower tries to serve read
-  uint64_t read_idx = raft.read_index();
-
-  EXPECT_EQ(read_idx, 0);
+  EXPECT_FALSE(raft.read_index().has_value());
 }
 
-// Test: Leader can initiate ReadIndex
-TEST_F(ReadIndexTest, LeaderInitiatesReadIndex) {
+TEST_F(ReadIndexTest, ReadCarriesANonzeroContextToEveryPeer) {
   kv::Raft raft(config);
+  elect_leader(raft);
 
-  // Become leader
-  raft.become_candidate();
-  raft.campaign();
-  raft.read_messages(); // Clear campaign messages
+  const auto read = raft.read_index();
+  const auto requests = raft.read_messages();
 
-  // Win election
-  kv::proto::Message vote_response;
-  vote_response.type = kv::proto::MsgRequestVoteResponse;
-  vote_response.from = 2;
-  vote_response.to = 1;
-  vote_response.term = 1;
-  vote_response.vote_granted = true;
-  raft.handle_request_vote_response(vote_response);
-
-  ASSERT_EQ(raft.get_state(), kv::State::Leader);
-
-  // Clear initial heartbeat from become_leader()
-  raft.read_messages();
-
-  // Initiate ReadIndex
-  uint64_t read_idx = raft.read_index();
-
-  // Should return current commit index (0 since no entries)
-  EXPECT_EQ(read_idx, 0);
-
-  // Should have sent heartbeats
-  auto msgs = raft.read_messages();
-  EXPECT_EQ(msgs.size(), 2); // To peers 2 and 3
-
-  for (const auto &msg : msgs) {
-    EXPECT_EQ(msg.type, kv::proto::MsgAppendEntries);
-    EXPECT_TRUE(msg.entries.empty()); // Heartbeat
-  }
+  ASSERT_TRUE(read.has_value());
+  ASSERT_EQ(read->safe_index, 1u);
+  ASSERT_EQ(requests.size(), 2u);
+  ASSERT_NE(requests.front().read_context, 0u);
+  EXPECT_EQ(requests.front().read_context, read->context);
+  EXPECT_EQ(requests[0].read_context, requests[1].read_context);
 }
 
-// Test: ReadIndex becomes ready after majority responds
-TEST_F(ReadIndexTest, ReadIndexBecomesReadyAfterMajority) {
+TEST_F(ReadIndexTest, ReadWaitsForCurrentTermCommitAndApply) {
   kv::Raft raft(config);
+  elect_leader(raft);
 
-  // Become leader
-  raft.become_candidate();
-  raft.campaign();
-  raft.read_messages();
+  const auto read = raft.read_index();
+  const auto requests = raft.read_messages();
+  ASSERT_TRUE(read.has_value());
+  ASSERT_EQ(read->safe_index, 1u);
+  ASSERT_EQ(requests.size(), 2u);
+  ASSERT_EQ(requests.front().entries.size(), 1u)
+      << "A fresh leader must establish a current-term commit barrier";
+  EXPECT_TRUE(requests.front().entries.front().data.empty());
 
-  kv::proto::Message vote_response;
-  vote_response.type = kv::proto::MsgRequestVoteResponse;
-  vote_response.from = 2;
-  vote_response.to = 1;
-  vote_response.term = 1;
-  vote_response.vote_granted = true;
-  raft.handle_request_vote_response(vote_response);
+  raft.handle_append_entries_response(successful_response(requests.front()));
 
-  ASSERT_EQ(raft.get_state(), kv::State::Leader);
-  raft.read_messages(); // Clear initial heartbeat
+  ASSERT_EQ(raft.get_commit_index(), read->safe_index);
+  EXPECT_FALSE(raft.read_index_ready(*read))
+      << "Committed is not enough; the state machine must apply the barrier";
 
-  // Initiate ReadIndex
-  uint64_t read_idx = raft.read_index();
-  raft.read_messages(); // Clear heartbeat messages
-
-  // Not ready yet (no responses)
-  EXPECT_FALSE(raft.read_index_ready(read_idx));
-
-  // Simulate heartbeat response from peer 2
-  kv::proto::Message hb_response;
-  hb_response.type = kv::proto::MsgAppendEntriesResponse;
-  hb_response.from = 2;
-  hb_response.to = 1;
-  hb_response.term = 1;
-  hb_response.success = true;
-  hb_response.match_index = 0;
-  raft.handle_append_entries_response(hb_response);
-
-  // Now ready! (Leader=1 + Peer2=1 = 2/3 majority)
-  EXPECT_TRUE(raft.read_index_ready(read_idx));
+  raft.advance(read->safe_index);
+  EXPECT_TRUE(raft.read_index_ready(*read));
 }
 
-// Test: ReadIndex with committed entries
-TEST_F(ReadIndexTest, ReadIndexWithCommittedEntries) {
+TEST_F(ReadIndexTest, DelayedResponseFromPriorRoundCannotConfirmNewRead) {
   kv::Raft raft(config);
+  elect_leader(raft);
 
-  // Become leader
-  raft.become_candidate();
-  raft.campaign();
-  raft.read_messages();
+  const auto first_read = raft.read_index();
+  const auto first_requests = raft.read_messages();
+  ASSERT_TRUE(first_read.has_value());
+  ASSERT_EQ(first_requests.size(), 2u);
+  raft.handle_append_entries_response(successful_response(first_requests.front()));
+  raft.advance(first_read->safe_index);
+  ASSERT_TRUE(raft.read_index_ready(*first_read));
+  raft.finish_read_index(*first_read);
 
-  kv::proto::Message vote_response;
-  vote_response.type = kv::proto::MsgRequestVoteResponse;
-  vote_response.from = 2;
-  vote_response.to = 1;
-  vote_response.term = 1;
-  vote_response.vote_granted = true;
-  raft.handle_request_vote_response(vote_response);
+  const auto second_read = raft.read_index();
+  const auto second_requests = raft.read_messages();
+  ASSERT_TRUE(second_read.has_value());
+  ASSERT_EQ(second_requests.size(), 2u);
+  ASSERT_NE(first_requests.front().read_context,
+            second_requests.front().read_context);
 
-  ASSERT_EQ(raft.get_state(), kv::State::Leader);
-  raft.read_messages();
+  raft.handle_append_entries_response(successful_response(first_requests.front()));
+  EXPECT_FALSE(raft.read_index_ready(*second_read));
 
-  // Propose an entry
-  std::vector<uint8_t> data = {1, 2, 3};
-  raft.propose(data);
-
-  // Simulate replication to peer 2 (majority)
-  kv::proto::Message rep_response;
-  rep_response.type = kv::proto::MsgAppendEntriesResponse;
-  rep_response.from = 2;
-  rep_response.to = 1;
-  rep_response.term = 1;
-  rep_response.success = true;
-  rep_response.match_index = 1; // Replicated entry 1
-  raft.handle_append_entries_response(rep_response);
-
-  // Entry should be committed now
-  EXPECT_EQ(raft.get_commit_index(), 1);
-
-  raft.read_messages(); // Clear replication messages
-
-  // Now do ReadIndex
-  uint64_t read_idx = raft.read_index();
-
-  // Should return commit index = 1
-  EXPECT_EQ(read_idx, 1);
-
-  raft.read_messages(); // Clear heartbeat
-
-  // Simulate heartbeat response
-  kv::proto::Message hb_response;
-  hb_response.type = kv::proto::MsgAppendEntriesResponse;
-  hb_response.from = 2;
-  hb_response.to = 1;
-  hb_response.term = 1;
-  hb_response.success = true;
-  hb_response.match_index = 1;
-  raft.handle_append_entries_response(hb_response);
-
-  // ReadIndex should be ready
-  EXPECT_TRUE(raft.read_index_ready(read_idx));
+  raft.handle_append_entries_response(successful_response(second_requests.front()));
+  EXPECT_TRUE(raft.read_index_ready(*second_read));
 }
 
-// Test: Multiple ReadIndex requests
-TEST_F(ReadIndexTest, MultipleReadIndexRequests) {
+TEST_F(ReadIndexTest, CurrentTermReadAckFromOutsideClusterCannotConfirmRead) {
   kv::Raft raft(config);
+  elect_leader(raft);
 
-  // Become leader
-  raft.become_candidate();
-  raft.campaign();
-  raft.read_messages();
+  const auto barrier_read = raft.read_index();
+  const auto barrier_requests = raft.read_messages();
+  ASSERT_TRUE(barrier_read.has_value());
+  ASSERT_EQ(barrier_requests.size(), 2u);
+  raft.handle_append_entries_response(
+      successful_response(barrier_requests.front()));
+  raft.advance(barrier_read->safe_index);
+  ASSERT_TRUE(raft.read_index_ready(*barrier_read));
+  raft.finish_read_index(*barrier_read);
 
-  kv::proto::Message vote_response;
-  vote_response.type = kv::proto::MsgRequestVoteResponse;
-  vote_response.from = 2;
-  vote_response.to = 1;
-  vote_response.term = 1;
-  vote_response.vote_granted = true;
-  raft.handle_request_vote_response(vote_response);
+  const auto read = raft.read_index();
+  const auto requests = raft.read_messages();
+  ASSERT_TRUE(read.has_value());
+  ASSERT_EQ(requests.size(), 2u);
 
-  ASSERT_EQ(raft.get_state(), kv::State::Leader);
-  raft.read_messages();
+  auto outsider_ack = successful_response(requests.front());
+  outsider_ack.from = 99;
+  raft.handle_append_entries_response(outsider_ack);
 
-  // First ReadIndex request
-  uint64_t read_idx1 = raft.read_index();
-  raft.read_messages();
+  EXPECT_FALSE(raft.read_index_ready(*read));
 
-  // Get heartbeat response for first request
-  kv::proto::Message hb_response;
-  hb_response.type = kv::proto::MsgAppendEntriesResponse;
-  hb_response.from = 2;
-  hb_response.to = 1;
-  hb_response.term = 1;
-  hb_response.success = true;
-  hb_response.match_index = 0;
-  raft.handle_append_entries_response(hb_response);
-
-  // First request should be ready
-  EXPECT_TRUE(raft.read_index_ready(read_idx1));
-
-  // Second ReadIndex request (clears previous acks)
-  uint64_t read_idx2 = raft.read_index();
-  raft.read_messages();
-
-  // Not ready yet (no new responses)
-  EXPECT_FALSE(raft.read_index_ready(read_idx2));
-
-  // Get heartbeat response for second request
-  raft.handle_append_entries_response(hb_response);
-
-  // Second request should now be ready
-  EXPECT_TRUE(raft.read_index_ready(read_idx2));
+  raft.handle_append_entries_response(successful_response(requests.front()));
+  EXPECT_TRUE(raft.read_index_ready(*read));
 }
+
+TEST_F(ReadIndexTest, SameInFlightReadRoundCanBeCoalesced) {
+  kv::Raft raft(config);
+  elect_leader(raft);
+
+  const auto first_read = raft.read_index();
+  const auto requests = raft.read_messages();
+  const auto second_read = raft.read_index();
+
+  ASSERT_TRUE(first_read.has_value());
+  ASSERT_TRUE(second_read.has_value());
+  EXPECT_EQ(first_read->context, second_read->context);
+  EXPECT_EQ(first_read->safe_index, second_read->safe_index);
+  EXPECT_TRUE(raft.read_messages().empty())
+      << "Concurrent reads may safely share one quorum-confirmed round";
+
+  raft.handle_append_entries_response(successful_response(requests.front()));
+  raft.advance(first_read->safe_index);
+  EXPECT_TRUE(raft.read_index_ready(*first_read));
+}
+
+TEST_F(ReadIndexTest, LeadershipLossInvalidatesThePendingRound) {
+  kv::Raft raft(config);
+  elect_leader(raft);
+
+  const auto read = raft.read_index();
+  ASSERT_TRUE(read.has_value());
+  raft.read_messages();
+
+  kv::proto::Message heartbeat;
+  heartbeat.type = kv::proto::MsgAppendEntries;
+  heartbeat.from = 2;
+  heartbeat.to = 1;
+  heartbeat.term = raft.get_term();
+  heartbeat.prev_log_index = 0;
+  heartbeat.prev_log_term = 0;
+  raft.handle_append_entries(heartbeat);
+
+  EXPECT_EQ(raft.get_state(), kv::State::Follower);
+  EXPECT_FALSE(raft.read_index_ready(*read));
+  raft.finish_read_index(*read);
+  EXPECT_FALSE(raft.read_index().has_value());
+}
+
+TEST_F(ReadIndexTest, FinishingPriorRoundCannotClearNewRoundAtSameSafeIndex) {
+  kv::Raft raft(config);
+  elect_leader(raft);
+
+  const auto first_read = raft.read_index();
+  const auto first_requests = raft.read_messages();
+  ASSERT_TRUE(first_read.has_value());
+  ASSERT_EQ(first_requests.size(), 2u);
+  raft.handle_append_entries_response(successful_response(first_requests.front()));
+  raft.advance(first_read->safe_index);
+  ASSERT_TRUE(raft.read_index_ready(*first_read));
+  raft.finish_read_index(*first_read);
+
+  const auto second_read = raft.read_index();
+  const auto second_requests = raft.read_messages();
+  ASSERT_TRUE(second_read.has_value());
+  ASSERT_EQ(second_requests.size(), 2u);
+  ASSERT_EQ(first_read->safe_index, second_read->safe_index);
+  ASSERT_NE(first_read->context, second_read->context);
+
+  raft.finish_read_index(*first_read);
+  raft.handle_append_entries_response(successful_response(second_requests.front()));
+
+  EXPECT_TRUE(raft.read_index_ready(*second_read));
+}
+
+} // namespace

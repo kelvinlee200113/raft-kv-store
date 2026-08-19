@@ -1,21 +1,37 @@
 #pragma once
-#include <memory>
+
+#include <boost/asio/io_context.hpp>
 #include <raft/proto.h>
+
+#include <cstdint>
+#include <memory>
+#include <string>
 
 namespace kv {
 
 class Peer {
 public:
-  virtual ~Peer() = default;
+  static std::shared_ptr<Peer> create(std::uint64_t id,
+                                      const std::string &address,
+                                      boost::asio::io_context &io_context);
 
-  virtual void start() = 0;
-  virtual void send(proto::MessagePtr msg) = 0;
-  virtual void stop() = 0;
+  ~Peer();
 
-  static std::shared_ptr<Peer>
-  create(uint64_t peer_id, const std::string &peer_addr, void *io_service);
+  Peer(const Peer &) = delete;
+  Peer &operator=(const Peer &) = delete;
+
+  // Returns false when the bounded outbound queue cannot accept the message.
+  bool send(proto::MessagePtr message);
+  void stop();
+  std::uint64_t id() const noexcept;
+
+private:
+  struct Impl;
+  explicit Peer(std::shared_ptr<Impl> impl);
+
+  std::shared_ptr<Impl> impl_;
 };
 
-typedef std::shared_ptr<Peer> PeerPtr;
+using PeerPtr = std::shared_ptr<Peer>;
 
 } // namespace kv

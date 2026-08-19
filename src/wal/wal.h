@@ -62,7 +62,7 @@ public:
   const std::string& get_dir() const { return dir_; }
 
 private:
-  WAL(const std::string& dir, FILE* fp, uint64_t seq);
+  WAL(const std::string& dir, FILE* fp);
 
   // Append a record (header + data) to the in-memory write buffer
   void append_record(RecordType type, const uint8_t* data, size_t len);
@@ -81,8 +81,8 @@ private:
 
   std::string dir_;                // WAL directory path
   FILE* fp_;                       // Current open WAL file (append mode)
-  uint64_t seq_;                   // Sequence number of current file
   std::vector<uint8_t> buffer_;    // In-memory write buffer (flushed on sync)
+  bool failed_ = false;            // A failed flush makes this handle unusable
 };
 
 } // namespace wal

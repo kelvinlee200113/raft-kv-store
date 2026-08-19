@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include <raft/raft.h>
 
+#include <algorithm>
+
 using namespace kv;
 
 // Helper function to create a 3-node Raft cluster
@@ -98,6 +100,134 @@ protected:
   std::unique_ptr<Raft> node2_;
   std::unique_ptr<Raft> node3_;
 };
+
+TEST_F(ReplicationTest, CandidateStepsDownForSameTermLeader) {
+  node3_->become_candidate();
+  ASSERT_EQ(node3_->get_state(), State::Candidate);
+  ASSERT_EQ(node3_->get_term(), 1u);
+  ASSERT_EQ(node3_->get_voted_for(), 3u);
+
+  proto::Message heartbeat;
+  heartbeat.type = proto::MsgAppendEntries;
+  heartbeat.from = 2;
+  heartbeat.to = 3;
+  heartbeat.term = 1;
+  heartbeat.prev_log_index = 0;
+  heartbeat.prev_log_term = 0;
+  heartbeat.leader_commit = 0;
+
+  const auto response = node3_->handle_append_entries(heartbeat);
+
+  EXPECT_TRUE(response.success);
+  EXPECT_EQ(node3_->get_state(), State::Follower);
+  EXPECT_EQ(node3_->get_leader(), 2u);
+  EXPECT_EQ(node3_->get_voted_for(), 3u)
+      << "Stepping down in the same term must not grant a second vote";
+}
+
+TEST_F(ReplicationTest, ProposalReportsLeaderAcceptanceAndLogIndex) {
+  EXPECT_FALSE(node2_->propose({1, 2, 3}).has_value());
+
+  make_node1_leader();
+  const auto accepted = node1_->propose({1, 2, 3});
+
+  ASSERT_TRUE(accepted.has_value());
+  EXPECT_EQ(*accepted, 1u);
+}
+
+TEST_F(ReplicationTest, FollowerRejectsLeaderOutsideStaticCluster) {
+  proto::Message append;
+  append.type = proto::MsgAppendEntries;
+  append.from = 99;
+  append.to = 2;
+  append.term = 100;
+  append.prev_log_index = 0;
+
+  const auto response = node2_->handle_append_entries(append);
+
+  EXPECT_FALSE(response.success);
+  EXPECT_EQ(response.term, 0u);
+  EXPECT_EQ(node2_->get_term(), 0u);
+  EXPECT_TRUE(node2_->get_log().empty());
+}
+
+TEST_F(ReplicationTest, CommittedEntryIsNeverReplacedByAConflictingLeader) {
+  proto::Entry committed;
+  committed.index = 1;
+  committed.term = 1;
+  committed.type = proto::EntryNormal;
+  committed.data = {1};
+
+  proto::Message first_append;
+  first_append.type = proto::MsgAppendEntries;
+  first_append.from = 1;
+  first_append.to = 2;
+  first_append.term = 1;
+  first_append.prev_log_index = 0;
+  first_append.prev_log_term = 0;
+  first_append.entries = {committed};
+  first_append.leader_commit = 1;
+  ASSERT_TRUE(node2_->handle_append_entries(first_append).success);
+  ASSERT_EQ(node2_->get_commit_index(), 1u);
+
+  proto::Entry conflict = committed;
+  conflict.term = 2;
+  conflict.data = {9};
+
+  proto::Message conflicting_append = first_append;
+  conflicting_append.from = 3;
+  conflicting_append.term = 2;
+  conflicting_append.entries = {conflict};
+
+  const auto response = node2_->handle_append_entries(conflicting_append);
+
+  EXPECT_FALSE(response.success);
+  ASSERT_EQ(node2_->get_log().size(), 1u);
+  EXPECT_EQ(node2_->get_log().front().term, 1u);
+  EXPECT_EQ(node2_->get_log().front().data, (std::vector<uint8_t>{1}));
+  EXPECT_EQ(node2_->get_commit_index(), 1u);
+}
+
+TEST_F(ReplicationTest, LeaderIgnoresAppendResponseFromOutsideStaticCluster) {
+  make_node1_leader();
+  ASSERT_TRUE(node1_->propose({1}).has_value());
+
+  proto::Message forged_response;
+  forged_response.type = proto::MsgAppendEntriesResponse;
+  forged_response.from = 99;
+  forged_response.to = 1;
+  forged_response.term = 100;
+  forged_response.success = true;
+  forged_response.match_index = 1;
+  node1_->handle_append_entries_response(forged_response);
+
+  EXPECT_EQ(node1_->get_state(), State::Leader);
+  EXPECT_EQ(node1_->get_term(), 1u);
+  EXPECT_EQ(node1_->get_commit_index(), 0u);
+}
+
+TEST_F(ReplicationTest, FailedAppendAtFirstIndexDoesNotUnderflowProgress) {
+  make_node1_leader();
+  node1_->read_messages();
+
+  proto::Message failure;
+  failure.type = proto::MsgAppendEntriesResponse;
+  failure.from = 2;
+  failure.to = 1;
+  failure.term = 1;
+  failure.success = false;
+  node1_->handle_append_entries_response(failure);
+
+  EXPECT_EQ(node1_->get_progress().at(2).next, 1u);
+  const auto retry = node1_->read_messages();
+  ASSERT_FALSE(retry.empty());
+  EXPECT_TRUE(std::any_of(retry.begin(), retry.end(), [](const auto &message) {
+    return message.to == 2 && message.type == proto::MsgAppendEntries;
+  }));
+  EXPECT_FALSE(std::any_of(retry.begin(), retry.end(), [](const auto &message) {
+    return message.to == 2 && message.type == proto::MsgInstallSnapshot;
+  }));
+}
 
 // Test 1: Basic Replication - leader proposes, followers replicate
 TEST_F(ReplicationTest, BasicReplication) {
@@ -210,65 +340,28 @@ TEST_F(ReplicationTest, FollowerCommitUpdate) {
 
 // Test 4: Conflict Resolution - follower has conflicting entry
 TEST_F(ReplicationTest, ConflictResolution) {
-  make_node1_leader();
-
-  // Leader proposes entry at index 1, term 1
-  std::vector<uint8_t> leader_data = {1, 1, 1};
-  node1_->propose(leader_data);
-
-  // Deliver to node2 only (node3 doesn't get it)
-  auto msgs = node1_->read_messages();
-  for (const auto &msg : msgs) {
-    if (msg.to == 2 && msg.type == proto::MsgAppendEntries) {
-      auto response = node2_->handle_append_entries(msg);
-      node2_->send(response);
-    }
-  }
-
-  // Now node2 has [Entry(1, term=1)]
-  EXPECT_EQ(node2_->get_log().size(), 1);
-  EXPECT_EQ(node2_->get_log()[0].term, 1);
-
-  // Simulate node3 having a conflicting entry from a failed leader in term 2
-  // We'll manually create a conflicting log on node3
+  // Node 3 starts with an uncommitted entry from an earlier term.
   proto::Entry conflict_entry;
   conflict_entry.index = 1;
-  conflict_entry.term = 2; // Different term!
+  conflict_entry.term = 2;
   conflict_entry.data = {2, 2, 2};
   conflict_entry.type = proto::EntryNormal;
+  node3_->test_append_log_entry(conflict_entry);
+  node3_->become_follower(2, 0);
 
-  // Manually inject conflicting entry into node3
-  // We need to simulate this by having node3 receive AppendEntries from a fake
-  // term 2 leader
-  node3_->become_follower(2, 99); // Pretend there was a term 2 leader
+  // Node 1 is the later-term leader with a different entry at index 1.
+  node1_->become_candidate();        // term 1
+  node1_->become_follower(2, 0);     // observe term 2
+  node1_->become_candidate();        // term 3
+  node1_->become_leader();
+  const std::vector<uint8_t> leader_data = {1, 1, 1};
+  ASSERT_TRUE(node1_->propose(leader_data).has_value());
 
-  proto::Message fake_append;
-  fake_append.type = proto::MsgAppendEntries;
-  fake_append.from = 99;
-  fake_append.to = 3;
-  fake_append.term = 2;
-  fake_append.prev_log_index = 0;
-  fake_append.prev_log_term = 0;
-  fake_append.entries = {conflict_entry};
-  fake_append.leader_commit = 0;
-
-  node3_->handle_append_entries(fake_append);
-
-  // Now node3 has [Entry(1, term=2)] - conflicting!
-  EXPECT_EQ(node3_->get_log().size(), 1);
-  EXPECT_EQ(node3_->get_log()[0].term, 2);
-
-  // Now real leader (node1, term=1) tries to send AppendEntries to node3
-  // Node3 will reject because it's in term 2
-  // Let's simulate node3 stepping down to term 1 first
-  node3_->become_follower(1, 1);
-
-  // Now send AppendEntries from leader
   proto::Message append_msg;
   append_msg.type = proto::MsgAppendEntries;
   append_msg.from = 1;
   append_msg.to = 3;
-  append_msg.term = 1;
+  append_msg.term = 3;
   append_msg.prev_log_index = 0;
   append_msg.prev_log_term = 0;
   append_msg.entries.push_back(node1_->get_log()[0]);
@@ -278,12 +371,23 @@ TEST_F(ReplicationTest, ConflictResolution) {
 
   // Node3 should detect conflict at index 1 and replace it
   EXPECT_EQ(node3_->get_log().size(), 1);
-  EXPECT_EQ(node3_->get_log()[0].term, 1); // Should now match leader's term
+  EXPECT_EQ(node3_->get_log()[0].term, 3);
   EXPECT_EQ(node3_->get_log()[0].data, leader_data);
 }
 
-// Test 5: Partial Replication - only one follower replicates (no commit)
-TEST_F(ReplicationTest, PartialReplication) {
+TEST_F(ReplicationTest, LeaderAloneCannotCommitAProposal) {
+  make_node1_leader();
+  node1_->read_messages();
+
+  ASSERT_TRUE(node1_->propose({1, 2, 3}).has_value());
+
+  EXPECT_EQ(node1_->get_commit_index(), 0u);
+  EXPECT_EQ(node2_->get_log().size(), 0u);
+  EXPECT_EQ(node3_->get_log().size(), 0u);
+}
+
+// One follower plus the leader is the required two-of-three majority.
+TEST_F(ReplicationTest, LeaderAndOneFollowerFormAMajority) {
   make_node1_leader();
 
   // Propose entry
@@ -305,13 +409,70 @@ TEST_F(ReplicationTest, PartialReplication) {
   // Node3 does NOT have the entry
   EXPECT_EQ(node3_->get_log().size(), 0);
 
-  // Leader should NOT commit (only 2 out of 3 nodes - not a majority)
-  // Note: In a 3-node cluster, we need 2 nodes (including leader) to commit
-  // Leader itself counts as 1, node2 counts as 1 = 2 total, which IS a
-  // majority! So this should actually commit.
+  // The leader and node 2 are two of the three configured members.
   EXPECT_EQ(node1_->get_commit_index(), 1);
+}
 
-  // Let's test with a 5-node cluster instead for true partial replication
+TEST_F(ReplicationTest,
+       OlderTermEntryCommitsOnlyWithAReplicatedCurrentTermEntry) {
+  proto::Entry older_entry;
+  older_entry.index = 1;
+  older_entry.term = 1;
+  older_entry.type = proto::EntryNormal;
+  older_entry.data = {1};
+
+  proto::Message older_append;
+  older_append.type = proto::MsgAppendEntries;
+  older_append.from = 3;
+  older_append.term = 1;
+  older_append.prev_log_index = 0;
+  older_append.prev_log_term = 0;
+  older_append.entries = {older_entry};
+  older_append.leader_commit = 0;
+
+  older_append.to = 1;
+  ASSERT_TRUE(node1_->handle_append_entries(older_append).success);
+  older_append.to = 2;
+  ASSERT_TRUE(node2_->handle_append_entries(older_append).success);
+
+  node1_->become_candidate();
+  node1_->campaign();
+  const auto vote_requests = node1_->read_messages();
+  const auto vote_request = std::find_if(
+      vote_requests.begin(), vote_requests.end(), [](const auto &message) {
+        return message.type == proto::MsgRequestVote && message.to == 2;
+      });
+  ASSERT_NE(vote_request, vote_requests.end());
+  node1_->handle_request_vote_response(
+      node2_->handle_request_vote(*vote_request));
+  ASSERT_EQ(node1_->get_state(), State::Leader);
+  ASSERT_EQ(node1_->get_term(), 2u);
+
+  const auto heartbeats = node1_->read_messages();
+  const auto node2_heartbeat = std::find_if(
+      heartbeats.begin(), heartbeats.end(), [](const auto &message) {
+        return message.type == proto::MsgAppendEntries && message.to == 2;
+      });
+  ASSERT_NE(node2_heartbeat, heartbeats.end());
+  node1_->handle_append_entries_response(
+      node2_->handle_append_entries(*node2_heartbeat));
+
+  ASSERT_EQ(node1_->get_progress().at(2).match, 1u);
+  EXPECT_EQ(node1_->get_commit_index(), 0u)
+      << "A majority cannot directly commit an entry from an older term";
+
+  ASSERT_EQ(node1_->propose({2}), 2u);
+  const auto appends = node1_->read_messages();
+  const auto node2_append = std::find_if(
+      appends.begin(), appends.end(), [](const auto &message) {
+        return message.type == proto::MsgAppendEntries && message.to == 2;
+      });
+  ASSERT_NE(node2_append, appends.end());
+  node1_->handle_append_entries_response(
+      node2_->handle_append_entries(*node2_append));
+
+  EXPECT_EQ(node1_->get_commit_index(), 2u)
+      << "Committing a current-term entry also commits its log prefix";
 }
 
 // Test 6: Get Entries To Apply
@@ -343,16 +504,15 @@ TEST_F(ReplicationTest, GetEntriesToApply) {
   // All 3 entries should be committed now
   EXPECT_EQ(node1_->get_commit_index(), 3);
 
-  // Initially, last_applied = 0, so we should get all 3 entries
-  auto entries = node1_->get_entries_to_apply();
-  EXPECT_EQ(entries.size(), 3);
-  EXPECT_EQ(entries[0].index, 1);
-  EXPECT_EQ(entries[1].index, 2);
-  EXPECT_EQ(entries[2].index, 3);
+  // The state-machine owner receives only the next committed entry.
+  const auto entry = node1_->next_entry_to_apply();
+  ASSERT_TRUE(entry.has_value());
+  EXPECT_EQ(entry->index, 1u);
 
-  // If we call again without updating last_applied_, should get same entries
-  entries = node1_->get_entries_to_apply();
-  EXPECT_EQ(entries.size(), 3);
+  // Until it acknowledges application, the same entry remains next.
+  const auto repeated = node1_->next_entry_to_apply();
+  ASSERT_TRUE(repeated.has_value());
+  EXPECT_EQ(repeated->index, 1u);
 }
 
 // Test 7: Advance - update last_applied after applying entries
@@ -371,27 +531,28 @@ TEST_F(ReplicationTest, Advance) {
   EXPECT_EQ(node1_->get_commit_index(), 5);
   EXPECT_EQ(node1_->get_last_applied(), 0);  // Not applied yet
 
-  // Get entries to apply
-  auto entries = node1_->get_entries_to_apply();
-  EXPECT_EQ(entries.size(), 5);
-
-  // Apply first 3 entries
-  node1_->advance(3);
+  // Apply the first three entries in order.
+  for (std::uint64_t expected = 1; expected <= 3; ++expected) {
+    const auto entry = node1_->next_entry_to_apply();
+    ASSERT_TRUE(entry.has_value());
+    EXPECT_EQ(entry->index, expected);
+    node1_->advance(entry->index);
+  }
   EXPECT_EQ(node1_->get_last_applied(), 3);
 
-  // Now get_entries_to_apply should return only remaining 2
-  entries = node1_->get_entries_to_apply();
-  EXPECT_EQ(entries.size(), 2);
-  EXPECT_EQ(entries[0].index, 4);
-  EXPECT_EQ(entries[1].index, 5);
+  const auto fourth = node1_->next_entry_to_apply();
+  ASSERT_TRUE(fourth.has_value());
+  EXPECT_EQ(fourth->index, 4u);
 
-  // Apply remaining entries
-  node1_->advance(5);
+  node1_->advance(fourth->index);
+  const auto fifth = node1_->next_entry_to_apply();
+  ASSERT_TRUE(fifth.has_value());
+  EXPECT_EQ(fifth->index, 5u);
+  node1_->advance(fifth->index);
   EXPECT_EQ(node1_->get_last_applied(), 5);
 
   // No more entries to apply
-  entries = node1_->get_entries_to_apply();
-  EXPECT_EQ(entries.size(), 0);
+  EXPECT_FALSE(node1_->next_entry_to_apply().has_value());
 
   // Test invariant: Can't go backward
   node1_->advance(3);

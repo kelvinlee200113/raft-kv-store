@@ -2,19 +2,26 @@
 #include <raft/config.h>
 #include <raft/proto.h>
 #include <wal/wal.h>
-#include <common/lock_free_queue.h>
 #include <stdint.h>
 #include <unordered_map>
 #include <vector>
-#include <mutex>
-#include <thread>
-#include <atomic>
+#include <optional>
+#include <random>
 #include <functional>
 
 namespace kv {
 
 // Raft node states
 enum class State { Follower, PreCandidate, Candidate, Leader };
+
+struct ReadIndexToken {
+  uint64_t context = 0;
+  uint64_t safe_index = 0;
+
+  bool operator==(const ReadIndexToken &other) const {
+    return context == other.context && safe_index == other.safe_index;
+  }
+};
 
 // Progress tracks replication progress for each follower
 struct Progress {
@@ -67,60 +74,54 @@ public:
 
   void handle_install_snapshot_response(const proto::Message &msg);
 
-  void propose(const std::vector<uint8_t> &data);
+  std::optional<uint64_t> propose(const std::vector<uint8_t> &data);
 
-  // Legacy mutex-based API (for backward compatibility)
-  std::vector<proto::Entry> get_entries_to_apply();
+  // Return the next committed entry until the state-machine owner advances it.
+  std::optional<proto::Entry> next_entry_to_apply() const;
   void advance(uint64_t index);
-
-  // Lock-free API for high-performance async apply
-  // Returns pointer to apply queue (producer pushes, consumer pops)
-  LockFreeQueue<proto::Entry>* get_apply_queue() { return apply_queue_.get(); }
-
-  // Start the async apply thread
-  // state_machine: Callback function to apply an entry
-  // The callback receives (index, data) and should apply the entry to the state machine
-  void start_apply_thread(std::function<void(uint64_t, const std::vector<uint8_t>&)> state_machine);
-
-  // Stop the async apply thread (blocks until thread exits)
-  void stop_apply_thread();
 
   // Snapshot: Compact log by taking a snapshot of the state machine
   // state_snapshot: serialized state machine bytes (from KVStore::serialize())
   void take_snapshot(const std::vector<uint8_t>& state_snapshot);
+  void take_snapshot(uint64_t applied_index,
+                     const std::vector<uint8_t> &state_snapshot);
 
   // Check if a snapshot should be taken (threshold crossed)
   // Returns true if (last_applied - last_snapshot_index) >= threshold
-  bool should_snapshot() const {
-    return snapshot_threshold_ > 0 &&
-           (last_applied_ - last_snapshot_index_) >= snapshot_threshold_;
-  }
+  bool should_snapshot() const;
 
-  // ReadIndex: Linearizable reads without going through the log
-  // Returns the commit index that can be safely read once confirmed
-  uint64_t read_index();
+  // ReadIndex: Linearizable reads without going through the log.
+  // The token identifies both the quorum round and its applied-index fence.
+  std::optional<ReadIndexToken> read_index();
 
   // Check if ReadIndex confirmation is ready (majority responded to heartbeat)
-  bool read_index_ready(uint64_t read_index);
+  bool read_index_ready(const ReadIndexToken &read);
+
+  // Release the active ReadIndex round after all coalesced callers have read.
+  void finish_read_index(const ReadIndexToken &read);
 
   // Attach a WAL for crash recovery (optional — tests may omit this)
-  void set_wal(std::unique_ptr<wal::WAL> w) { wal_ = std::move(w); }
+  void set_wal(std::unique_ptr<wal::WAL> w) {
+    wal_ = std::move(w);
+    storage_failed_ = false;
+  }
+  bool storage_healthy() const { return !storage_failed_; }
+
+  void set_snapshot_restore_callback(
+      std::function<bool(uint64_t, const std::vector<uint8_t> &)> callback) {
+    snapshot_restore_ = std::move(callback);
+  }
 
   // Restore Raft state from WAL recovery (call once at startup, before event loop)
   // Loads log entries and HardState atomically. last_applied stays at 0 —
   // caller must replay entries [1..commit_index] into the state machine.
   void restore(const wal::HardStateProto& hard_state, const std::vector<proto::Entry>& entries);
+  void restore(const wal::HardStateProto &hard_state,
+               const std::vector<proto::Entry> &entries,
+               const wal::SnapshotMeta &snapshot);
 
   // Test helpers: For testing only
-  void test_set_commit_index(uint64_t index) {
-    std::lock_guard<std::mutex> lock(apply_mutex_);
-    uint64_t old_commit = commit_index_;
-    commit_index_ = index;
-    // Push newly committed entries to queue (for async apply)
-    if (index > old_commit) {
-      push_entries_to_apply_queue(old_commit, index);
-    }
-  }
+  void test_set_commit_index(uint64_t index) { commit_index_ = index; }
   void test_append_log_entry(const proto::Entry& entry) { log_.push_back(entry); }
   size_t test_get_log_size() const { return log_.size(); }
 
@@ -146,13 +147,20 @@ public:
   const std::unordered_map<uint64_t, bool> &get_votes() const { return votes_; }
 
 private:
-  // Helper: Push newly committed entries to apply queue
-  // Must be called with apply_mutex_ held
-  void push_entries_to_apply_queue(uint64_t old_commit, uint64_t new_commit);
-
   // Log index helpers (account for log_offset_ after compaction)
   uint64_t last_log_index() const { return log_offset_ + log_.size(); }
   const proto::Entry& log_entry(uint64_t index) const { return log_[index - log_offset_ - 1]; }
+  uint64_t term_at(uint64_t index) const;
+  uint64_t last_log_term() const {
+    return log_.empty() ? log_offset_term_ : log_.back().term;
+  }
+  bool is_log_up_to_date(uint64_t candidate_index,
+                         uint64_t candidate_term) const;
+  bool is_member(uint64_t node_id) const;
+  bool prepare_for_leader_rpc(const proto::Message &msg);
+  proto::Message make_install_snapshot(uint64_t peer_id) const;
+  bool has_committed_entry_in_current_term() const;
+  bool sync_wal();
 
   uint64_t id_;
   uint64_t term_;
@@ -163,6 +171,7 @@ private:
   State state_;
   std::vector<proto::Entry> log_;
   uint64_t log_offset_;  // Index of last compacted entry (0 = nothing compacted)
+  uint64_t log_offset_term_;
   std::unordered_map<uint64_t, Progress> progress_;
   std::vector<uint64_t> peers_;
 
@@ -178,41 +187,33 @@ private:
   uint32_t election_elapsed_;            // Ticks since last reset
   uint32_t randomized_election_timeout_; // Random timeout for this election
   uint32_t heartbeat_elapsed_;           // Ticks since last heartbeat
+  std::mt19937_64 election_rng_;
 
   // Voting
   std::unordered_map<uint64_t, bool>
       votes_; // Track votes received (node_id -> granted)
   std::unordered_map<uint64_t, bool>
       pre_votes_; // Track pre-votes received (node_id -> granted)
+  uint64_t pending_pre_vote_term_;
 
   // ReadIndex state
   bool read_index_pending_;               // Is there a pending ReadIndex request?
   uint64_t pending_read_index_;           // Commit index when read was requested
+  uint64_t pending_read_context_;
+  uint64_t next_read_context_;
   std::unordered_map<uint64_t, bool> read_index_acks_;  // Track which peers acked
 
   // Snapshot cache (for InstallSnapshot RPC)
   std::vector<uint8_t> last_snapshot_data_;  // Cached snapshot data to send to followers
+  std::function<bool(uint64_t, const std::vector<uint8_t> &)>
+      snapshot_restore_;
 
   // WAL for crash recovery (nullptr if not attached)
   std::unique_ptr<wal::WAL> wal_;
+  bool storage_failed_;
 
   // Outgoing messages queue
   std::vector<proto::Message> msgs_;
-
-  // Thread safety for async apply
-  mutable std::mutex apply_mutex_;  // Protects last_applied_ and commit_index_
-
-  // Lock-free queue for async apply (SPSC: Raft thread -> Apply thread)
-  // Capacity of 10000 entries (~10MB for typical entries)
-  std::unique_ptr<LockFreeQueue<proto::Entry>> apply_queue_;
-
-  // Async apply thread
-  std::thread apply_thread_;
-  std::atomic<bool> apply_thread_running_;
-  std::function<void(uint64_t, const std::vector<uint8_t>&)> state_machine_apply_;
-
-  // Apply thread main loop
-  void apply_thread_loop();
 };
 
 } // namespace kv

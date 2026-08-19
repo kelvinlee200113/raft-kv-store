@@ -1,46 +1,167 @@
 #include "raft/proto.h"
 #include <algorithm>
 #include <cstdint>
-#include <cstdlib>
+#include <chrono>
+#include <set>
+#include <stdexcept>
 #include <raft/raft.h>
+
+namespace {
+
+uint64_t election_seed(const kv::Config &config) {
+  if (config.random_seed != 0) {
+    return config.random_seed;
+  }
+  std::random_device device;
+  const auto now = static_cast<uint64_t>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  return (static_cast<uint64_t>(device()) << 32U) ^ device() ^ now ^
+         (config.id * 0x9e3779b97f4a7c15ULL);
+}
+
+} // namespace
 
 namespace kv {
 
 Raft::Raft(const Config &config)
     : id_(config.id), term_(0), lead_(0), voted_for_(0), commit_index_(0),
-      last_applied_(0), state_(State::Follower), log_offset_(0), peers_(config.peers),
+      last_applied_(0), state_(State::Follower), log_offset_(0),
+      log_offset_term_(0), peers_(config.peers),
       election_timeout_(config.election_tick),
       heartbeat_timeout_(config.heartbeat_tick),
       snapshot_threshold_(config.snapshot_threshold), last_snapshot_index_(0),
       election_elapsed_(0),
       randomized_election_timeout_(0), heartbeat_elapsed_(0),
+      election_rng_(election_seed(config)),
+      pending_pre_vote_term_(0),
       read_index_pending_(false), pending_read_index_(0),
-      apply_queue_(std::make_unique<LockFreeQueue<proto::Entry>>(10000)) {
+      pending_read_context_(0), next_read_context_(1),
+      storage_failed_(false) {
 
-  // Initialize atomic (can't be in initializer list)
-  apply_thread_running_.store(false);
+  const std::set<uint64_t> unique_peers(peers_.begin(), peers_.end());
+  if (id_ == 0 || election_timeout_ == 0 || heartbeat_timeout_ == 0 ||
+      peers_.size() != 3 || unique_peers.size() != peers_.size() ||
+      std::find(peers_.begin(), peers_.end(), 0) != peers_.end() ||
+      std::find(peers_.begin(), peers_.end(), id_) == peers_.end()) {
+    throw std::invalid_argument("invalid Raft configuration");
+  }
 
   // Generate random election timeout (between election_timeout to
   // 2*election_timeout)
-  randomized_election_timeout_ =
-      election_timeout_ + (rand() % election_timeout_);
+  reset_randomized_election_timeout();
 }
 
 void Raft::restore(const wal::HardStateProto& hard_state, const std::vector<proto::Entry>& entries) {
-  log_ = entries;
+  restore(hard_state, entries, wal::SnapshotMeta{});
+}
+
+void Raft::restore(const wal::HardStateProto &hard_state,
+                   const std::vector<proto::Entry> &entries,
+                   const wal::SnapshotMeta &snapshot) {
+  log_offset_ = snapshot.index;
+  log_offset_term_ = snapshot.term;
+  last_snapshot_index_ = snapshot.index;
+  last_snapshot_data_ = snapshot.state;
+  log_.clear();
+  uint64_t expected_index = log_offset_ + 1;
+  for (const auto &entry : entries) {
+    if (entry.index > log_offset_) {
+      if (entry.index != expected_index) {
+        throw std::invalid_argument("recovered Raft log contains an index gap");
+      }
+      log_.push_back(entry);
+      ++expected_index;
+    }
+  }
   term_ = hard_state.term;
   voted_for_ = hard_state.vote;
-  commit_index_ = hard_state.commit;
-  // last_applied_ intentionally stays 0 — caller replays committed entries
-  // into the state machine and then calls advance(commit_index).
+  commit_index_ = std::max(snapshot.index, hard_state.commit);
+  if (commit_index_ > last_log_index()) {
+    throw std::invalid_argument(
+        "recovered Raft log is missing a committed entry");
+  }
+  last_applied_ = snapshot.index;
+}
+
+uint64_t Raft::term_at(uint64_t index) const {
+  if (index == 0) {
+    return 0;
+  }
+  if (index == log_offset_) {
+    return log_offset_term_;
+  }
+  if (index < log_offset_ || index > last_log_index()) {
+    return 0;
+  }
+  return log_entry(index).term;
+}
+
+bool Raft::sync_wal() {
+  if (!wal_ || wal_->sync()) {
+    return true;
+  }
+  storage_failed_ = true;
+  return false;
 }
 
 void Raft::become_follower(uint64_t term, uint64_t leader) {
+  if (term < term_) {
+    return;
+  }
+  const bool advanced_term = term > term_;
   state_ = State::Follower;
   term_ = term;
   lead_ = leader;
-  voted_for_ = 0;
+  if (advanced_term) {
+    voted_for_ = 0;
+  }
+  read_index_pending_ = false;
+  pending_read_index_ = 0;
+  pending_read_context_ = 0;
+  read_index_acks_.clear();
+  pending_pre_vote_term_ = 0;
   reset_randomized_election_timeout();
+
+  if (advanced_term && wal_) {
+    wal_->save_hard_state({term_, voted_for_, commit_index_});
+    sync_wal();
+  }
+}
+
+bool Raft::is_log_up_to_date(uint64_t candidate_index,
+                             uint64_t candidate_term) const {
+  const uint64_t local_term = last_log_term();
+  if (candidate_term != local_term) {
+    return candidate_term > local_term;
+  }
+  return candidate_index >= last_log_index();
+}
+
+bool Raft::is_member(uint64_t node_id) const {
+  return node_id != 0 &&
+         std::find(peers_.begin(), peers_.end(), node_id) != peers_.end();
+}
+
+bool Raft::prepare_for_leader_rpc(const proto::Message &msg) {
+  if (msg.to != id_ || msg.from == id_ || !is_member(msg.from)) {
+    return false;
+  }
+  if (msg.term > term_) {
+    become_follower(msg.term, msg.from);
+  }
+  if (storage_failed_ || msg.term < term_) {
+    return false;
+  }
+  if (state_ != State::Follower) {
+    become_follower(msg.term, msg.from);
+  }
+  reset_randomized_election_timeout();
+  lead_ = msg.from;
+  return true;
+}
+
+bool Raft::has_committed_entry_in_current_term() const {
+  return commit_index_ > 0 && term_at(commit_index_) == term_;
 }
 
 void Raft::become_pre_candidate() {
@@ -48,6 +169,7 @@ void Raft::become_pre_candidate() {
   // Don't increment term in PreVote!
   lead_ = 0;
   pre_votes_.clear();
+  pending_pre_vote_term_ = 0;
   reset_randomized_election_timeout();
 }
 
@@ -57,12 +179,13 @@ void Raft::become_candidate() {
   lead_ = 0;
   voted_for_ = id_;
   votes_.clear();
+  pending_pre_vote_term_ = 0;
   reset_randomized_election_timeout();
 
   // WAL-first: persist new term + self-vote before campaign() sends messages
   if (wal_) {
     wal_->save_hard_state({term_, voted_for_, commit_index_});
-    wal_->sync();
+    sync_wal();
   }
 }
 
@@ -89,6 +212,9 @@ void Raft::become_leader() {
 }
 
 void Raft::tick() {
+  if (storage_failed_) {
+    return;
+  }
   if (state_ == State::Leader) {
     // Leader sends periodic heartbeats
     heartbeat_elapsed_++;
@@ -123,8 +249,8 @@ void Raft::tick() {
 
 void Raft::reset_randomized_election_timeout() {
   election_elapsed_ = 0;
-  randomized_election_timeout_ =
-      election_timeout_ + (rand() % election_timeout_);
+  std::uniform_int_distribution<uint32_t> jitter(0, election_timeout_ - 1);
+  randomized_election_timeout_ = election_timeout_ + jitter(election_rng_);
 }
 
 proto::Message Raft::handle_request_vote(const proto::Message &msg) {
@@ -134,13 +260,24 @@ proto::Message Raft::handle_request_vote(const proto::Message &msg) {
   response.to = msg.from;
   response.vote_granted = false;
 
+  if (msg.to != id_ || msg.from == id_ || !is_member(msg.from)) {
+    response.term = term_;
+    return response;
+  }
+
   // Update term if candidate's term is higher
   if (msg.term > term_) {
     become_follower(msg.term, 0);
   }
 
+  if (storage_failed_) {
+    response.term = term_;
+    return response;
+  }
+
   // Check if should grant vote
-  if (msg.term >= term_ && (voted_for_ == 0 || voted_for_ == msg.from)) {
+  if (msg.term == term_ && (voted_for_ == 0 || voted_for_ == msg.from) &&
+      is_log_up_to_date(msg.last_log_index, msg.last_log_term)) {
     response.vote_granted = true;
     voted_for_ = msg.from;
     reset_randomized_election_timeout();
@@ -148,7 +285,9 @@ proto::Message Raft::handle_request_vote(const proto::Message &msg) {
     // WAL-first: persist vote before sending response
     if (wal_) {
       wal_->save_hard_state({term_, voted_for_, commit_index_});
-      wal_->sync();
+      if (!sync_wal()) {
+        response.vote_granted = false;
+      }
     }
   }
 
@@ -159,20 +298,15 @@ proto::Message Raft::handle_request_vote(const proto::Message &msg) {
 }
 
 void Raft::handle_request_vote_response(const proto::Message &msg) {
-  // Ensure we are still the candidate
-  if (state_ != State::Candidate) {
+  if (msg.to != id_ || msg.from == id_ || !is_member(msg.from)) {
     return;
   }
-
-  // Check term
-  if (msg.term < term_) {
-    // Stale
-    return;
-  }
-
   // If response is from higher term, step down
   if (msg.term > term_) {
     become_follower(msg.term, 0);
+    return;
+  }
+  if (msg.term < term_ || state_ != State::Candidate) {
     return;
   }
 
@@ -201,7 +335,18 @@ proto::Message Raft::handle_pre_vote(const proto::Message &msg) {
   response.type = proto::MsgPreVoteResponse;
   response.from = id_;
   response.to = msg.from;
+  response.pre_vote_term = msg.term;
   response.vote_granted = false;
+
+  if (msg.to != id_ || msg.from == id_ || !is_member(msg.from)) {
+    response.term = term_;
+    return response;
+  }
+
+  if (storage_failed_ || msg.term <= term_) {
+    response.term = term_;
+    return response;
+  }
 
   // Reject if we have a leader and it's still sending heartbeats
   // (election_elapsed_ is low)
@@ -212,22 +357,7 @@ proto::Message Raft::handle_pre_vote(const proto::Message &msg) {
 
   // Grant pre-vote if candidate's log is at least as up-to-date as ours
   // Same logic as RequestVote
-  bool log_ok = false;
-  if (log_.empty()) {
-    log_ok = true; // We have no log, anyone is ok
-  } else {
-    uint64_t our_last_index = last_log_index();
-    uint64_t our_last_term = log_entry(our_last_index).term;
-
-    if (msg.last_log_term > our_last_term) {
-      log_ok = true; // Candidate's last term is newer
-    } else if (msg.last_log_term == our_last_term &&
-               msg.last_log_index >= our_last_index) {
-      log_ok = true; // Same term, candidate's log is at least as long
-    }
-  }
-
-  if (log_ok) {
+  if (is_log_up_to_date(msg.last_log_index, msg.last_log_term)) {
     response.vote_granted = true;
   }
 
@@ -237,8 +367,20 @@ proto::Message Raft::handle_pre_vote(const proto::Message &msg) {
 
 // Handle PreVote response
 void Raft::handle_pre_vote_response(const proto::Message &msg) {
+  if (msg.to != id_ || msg.from == id_ || !is_member(msg.from)) {
+    return;
+  }
+  if (msg.term > term_) {
+    become_follower(msg.term, 0);
+    return;
+  }
   // Ensure we are still pre-candidate
   if (state_ != State::PreCandidate) {
+    return;
+  }
+
+  if (msg.pre_vote_term == 0 ||
+      msg.pre_vote_term != pending_pre_vote_term_) {
     return;
   }
 
@@ -264,23 +406,23 @@ void Raft::handle_pre_vote_response(const proto::Message &msg) {
 
 // PreCandidate pre-campaigning for itself
 void Raft::pre_campaign() {
+  if (storage_failed_) {
+    return;
+  }
   // Record pre-vote for self
+  pending_pre_vote_term_ = term_ + 1;
   pre_votes_[id_] = true;
   for (uint64_t peer_id : peers_) {
     if (peer_id != id_) {
-      // Create PreVote message (using CURRENT term, not term+1!)
+      // Ask whether peers would vote for us in the next term without changing
+      // our local term yet.
       proto::Message msg;
       msg.type = proto::MsgPreVote;
       msg.from = id_;
       msg.to = peer_id;
-      msg.term = term_; // Current term, not incremented!
-      if (log_.empty()) {
-        msg.last_log_index = 0;
-        msg.last_log_term = 0;
-      } else {
-        msg.last_log_index = log_.back().index;
-        msg.last_log_term = log_.back().term;
-      }
+      msg.term = pending_pre_vote_term_;
+      msg.last_log_index = last_log_index();
+      msg.last_log_term = last_log_term();
       msgs_.push_back(msg);
     }
   }
@@ -288,6 +430,9 @@ void Raft::pre_campaign() {
 
 // Candidate campaigning for itself
 void Raft::campaign() {
+  if (storage_failed_) {
+    return;
+  }
   // Record vote for self
   votes_[id_] = true;
   for (uint64_t peer_id : peers_) {
@@ -298,13 +443,8 @@ void Raft::campaign() {
       msg.from = id_;
       msg.to = peer_id;
       msg.term = term_;
-      if (log_.empty()) {
-        msg.last_log_index = 0;
-        msg.last_log_term = 0;
-      } else {
-        msg.last_log_index = log_.back().index;
-        msg.last_log_term = log_.back().term;
-      }
+      msg.last_log_index = last_log_index();
+      msg.last_log_term = last_log_term();
       msgs_.push_back(msg);
     }
   }
@@ -318,6 +458,18 @@ std::vector<proto::Message> Raft::read_messages() {
   return msgs;
 }
 
+proto::Message Raft::make_install_snapshot(uint64_t peer_id) const {
+  proto::Message message;
+  message.type = proto::MsgInstallSnapshot;
+  message.from = id_;
+  message.to = peer_id;
+  message.term = term_;
+  message.snapshot_index = log_offset_;
+  message.snapshot_term = log_offset_term_;
+  message.snapshot_data = last_snapshot_data_;
+  return message;
+}
+
 // Broadcast AppendEntries message (empty for heartbeats)
 void Raft::broadcast_heartbeat() {
   for (uint64_t peer_id : peers_) {
@@ -326,17 +478,7 @@ void Raft::broadcast_heartbeat() {
 
       // Check if this peer needs a snapshot (next index is already compacted)
       if (next_index <= log_offset_) {
-        // Send InstallSnapshot instead of AppendEntries
-        proto::Message snap_msg;
-        snap_msg.type = proto::MsgInstallSnapshot;
-        snap_msg.from = id_;
-        snap_msg.to = peer_id;
-        snap_msg.term = term_;
-        snap_msg.snapshot_index = log_offset_;
-        snap_msg.snapshot_term = (log_offset_ > 0 && !log_.empty()) ? log_.front().term : 0;
-        snap_msg.snapshot_data = last_snapshot_data_;  // Send cached snapshot
-
-        msgs_.push_back(snap_msg);
+        msgs_.push_back(make_install_snapshot(peer_id));
         continue;
       }
 
@@ -352,7 +494,7 @@ void Raft::broadcast_heartbeat() {
       if (prev_index == 0) {
         msg.prev_log_term = 0;
       } else {
-        msg.prev_log_term = log_entry(prev_index).term;
+        msg.prev_log_term = term_at(prev_index);
       }
 
       msg.entries.clear();
@@ -361,6 +503,8 @@ void Raft::broadcast_heartbeat() {
       }
 
       msg.leader_commit = commit_index_;
+      msg.read_context =
+          read_index_pending_ ? pending_read_context_ : 0;
       msgs_.push_back(msg);
     }
   }
@@ -372,28 +516,21 @@ proto::Message Raft::handle_append_entries(const proto::Message &msg) {
   response.from = id_;
   response.to = msg.from;
   response.success = false;
+  response.read_context = msg.read_context;
 
-  // Update term if leader's term is higher
-  if (msg.term > term_) {
-    become_follower(msg.term, msg.from);
-  }
-
-  // Reject if term is lower
-  if (msg.term < term_) {
+  if (!prepare_for_leader_rpc(msg)) {
     response.term = term_;
     return response;
   }
-
-  reset_randomized_election_timeout();
-  lead_ = msg.from;
 
   // Log consistency check
   bool log_ok = false;
 
   if (msg.prev_log_index == 0) {
     log_ok = true;
-  } else if (last_log_index() >= msg.prev_log_index) {
-    log_ok = log_entry(msg.prev_log_index).term == msg.prev_log_term;
+  } else if (msg.prev_log_index >= log_offset_ &&
+             last_log_index() >= msg.prev_log_index) {
+    log_ok = term_at(msg.prev_log_index) == msg.prev_log_term;
   }
 
   response.term = term_;
@@ -407,8 +544,15 @@ proto::Message Raft::handle_append_entries(const proto::Message &msg) {
   for (uint64_t i = 0; i < msg.entries.size(); ++i) {
     uint64_t index = msg.prev_log_index + i + 1;
 
+    if (index <= log_offset_) {
+      continue;
+    }
     if (index <= last_log_index()) {
-      if (log_entry(index).term != msg.entries[i].term) {
+      if (term_at(index) != msg.entries[i].term) {
+        if (index <= get_commit_index()) {
+          response.match_index = get_commit_index();
+          return response;
+        }
         // Conflict: truncate from this index onward, then append
         log_.erase(log_.begin() + (index - log_offset_ - 1), log_.end());
         log_.push_back(msg.entries[i]);
@@ -430,28 +574,27 @@ proto::Message Raft::handle_append_entries(const proto::Message &msg) {
 
   // WAL: flush all entries in one sync (batched)
   if (wal_ && !msg.entries.empty()) {
-    wal_->sync();
+    if (!sync_wal()) {
+      response.term = term_;
+      return response;
+    }
   }
 
   response.success = true;
   response.match_index = msg.prev_log_index + msg.entries.size();
 
   // Update commit index based on leader's commit
-  {
-    std::lock_guard<std::mutex> lock(apply_mutex_);
-    if (msg.leader_commit > commit_index_) {
-      uint64_t old_commit = commit_index_;
-      commit_index_ =
-          std::min(msg.leader_commit, last_log_index());
+  if (msg.leader_commit > commit_index_) {
+    commit_index_ = std::min(msg.leader_commit, last_log_index());
 
-      // WAL: persist new commit index
-      if (wal_) {
-        wal_->save_hard_state({term_, voted_for_, commit_index_});
-        wal_->sync();
+    // WAL: persist new commit index
+    if (wal_) {
+      wal_->save_hard_state({term_, voted_for_, commit_index_});
+      if (!sync_wal()) {
+        response.success = false;
+        response.term = term_;
+        return response;
       }
-
-      // Push newly committed entries to lock-free queue
-      push_entries_to_apply_queue(old_commit, commit_index_);
     }
   }
 
@@ -459,16 +602,22 @@ proto::Message Raft::handle_append_entries(const proto::Message &msg) {
 }
 
 void Raft::handle_append_entries_response(const proto::Message &msg) {
+  if (msg.to != id_ || msg.from == id_ || !is_member(msg.from)) {
+    return;
+  }
+  if (msg.term > term_) {
+    become_follower(msg.term, 0);
+    return;
+  }
+  if (storage_failed_) {
+    return;
+  }
   if (state_ != State::Leader) {
     return;
   }
 
-  if (term_ > msg.term) {
+  if (msg.term < term_) {
     return;
-  }
-
-  if (term_ < msg.term) {
-    become_follower(msg.term, 0);
   }
 
   if (msg.success) {
@@ -476,66 +625,56 @@ void Raft::handle_append_entries_response(const proto::Message &msg) {
     progress_[msg.from].next = progress_[msg.from].match + 1;
 
     // Track successful heartbeat response for ReadIndex
-    if (read_index_pending_) {
+    if (read_index_pending_ && msg.read_context != 0 &&
+        msg.read_context == pending_read_context_) {
       read_index_acks_[msg.from] = true;
     }
 
     // Try to advance commit index
-    {
-      std::lock_guard<std::mutex> lock(apply_mutex_);
-      uint64_t old_commit = commit_index_;
+    const uint64_t old_commit = commit_index_;
 
-      // Check each index from commit_index + 1 to last log index
-      for (uint64_t i = commit_index_ + 1; i <= last_log_index(); ++i) {
-        // Only commit entries from current term
-        if (log_entry(i).term != term_) {
-          continue;
-        }
+    // Check each index from commit_index + 1 to last log index
+    for (uint64_t i = commit_index_ + 1; i <= last_log_index(); ++i) {
+      // Only commit entries from current term
+      if (log_entry(i).term != term_) {
+        continue;
+      }
 
-        // Count how many nodes have replicated this entry
-        uint64_t replicas = 1; // Count self
-        for (const auto &pair : progress_) {
-          if (pair.second.match >= i) {
-            replicas++;
-          }
-        }
-
-        // If majority has replicated, commit it
-        if (replicas > peers_.size() / 2) {
-          commit_index_ = i;
+      // Count how many nodes have replicated this entry
+      uint64_t replicas = 1; // Count self
+      for (const auto &pair : progress_) {
+        if (pair.second.match >= i) {
+          replicas++;
         }
       }
 
-      // Push newly committed entries to lock-free queue
-      if (commit_index_ > old_commit) {
-        // WAL: persist new commit index before applying
-        if (wal_) {
-          wal_->save_hard_state({term_, voted_for_, commit_index_});
-          wal_->sync();
-        }
+      // If majority has replicated, commit it
+      if (replicas > peers_.size() / 2) {
+        commit_index_ = i;
+      }
+    }
 
-        push_entries_to_apply_queue(old_commit, commit_index_);
+    if (commit_index_ > old_commit) {
+      // WAL: persist new commit index before applying
+      if (wal_) {
+        wal_->save_hard_state({term_, voted_for_, commit_index_});
+        if (!sync_wal()) {
+          return;
+        }
       }
     }
 
   } else {
     // AppendEntries failed - follower doesn't have matching log entry
     // Decrement next and retry
-    progress_[msg.from].next--;
+    auto &progress = progress_[msg.from];
+    if (progress.next > 1) {
+      --progress.next;
+    }
 
     // Check if follower needs a snapshot (next index is already compacted)
-    if (progress_[msg.from].next <= log_offset_) {
-      // Follower needs entries we've already compacted - send snapshot
-      proto::Message snap_msg;
-      snap_msg.type = proto::MsgInstallSnapshot;
-      snap_msg.from = id_;
-      snap_msg.to = msg.from;
-      snap_msg.term = term_;
-      snap_msg.snapshot_index = log_offset_;
-      snap_msg.snapshot_term = (log_offset_ > 0 && !log_.empty()) ? log_.front().term : 0;
-      snap_msg.snapshot_data = last_snapshot_data_;  // Send cached snapshot
-
-      msgs_.push_back(snap_msg);
+    if (log_offset_ > 0 && progress.next <= log_offset_) {
+      msgs_.push_back(make_install_snapshot(msg.from));
     } else {
       // Follower just needs earlier entries - retry with AppendEntries
       broadcast_heartbeat();
@@ -543,9 +682,9 @@ void Raft::handle_append_entries_response(const proto::Message &msg) {
   }
 }
 
-void Raft::propose(const std::vector<uint8_t> &data) {
-  if (state_ != State::Leader) {
-    return;
+std::optional<uint64_t> Raft::propose(const std::vector<uint8_t> &data) {
+  if (state_ != State::Leader || storage_failed_) {
+    return std::nullopt;
   }
 
   proto::Entry entry;
@@ -559,60 +698,64 @@ void Raft::propose(const std::vector<uint8_t> &data) {
   // WAL: persist entry before broadcasting to followers
   if (wal_) {
     wal_->save_entry(entry);
-    wal_->sync();
+    if (!sync_wal()) {
+      log_.pop_back();
+      return std::nullopt;
+    }
   }
 
   broadcast_heartbeat();
+  return entry.index;
 }
 
-std::vector<proto::Entry> Raft::get_entries_to_apply() {
-  std::lock_guard<std::mutex> lock(apply_mutex_);
-  std::vector<proto::Entry> result;
-
+std::optional<proto::Entry> Raft::next_entry_to_apply() const {
   if (last_applied_ >= commit_index_) {
-    return result;
+    return std::nullopt;
   }
-
-  for (uint64_t i = last_applied_ + 1; i <= commit_index_; ++i) {
-    result.push_back(log_entry(i));
-  }
-
-  return result;
+  return log_entry(last_applied_ + 1);
 }
 
 void Raft::advance(uint64_t index) {
-  std::lock_guard<std::mutex> lock(apply_mutex_);
-  if (index > commit_index_ || index <= last_applied_) {
+  if (index > commit_index_ || index != last_applied_ + 1) {
     return;
   }
   last_applied_ = index;
 }
 
-void Raft::take_snapshot(const std::vector<uint8_t>& state_snapshot) {
-  std::lock_guard<std::mutex> lock(apply_mutex_);
+bool Raft::should_snapshot() const {
+  return snapshot_threshold_ > 0 && last_applied_ >= last_snapshot_index_ &&
+         (last_applied_ - last_snapshot_index_) >= snapshot_threshold_;
+}
 
-  // Can only snapshot up to last_applied_ (don't snapshot uncommitted state)
-  if (last_applied_ == 0 || last_applied_ <= log_offset_) {
+void Raft::take_snapshot(const std::vector<uint8_t>& state_snapshot) {
+  take_snapshot(last_applied_, state_snapshot);
+}
+
+void Raft::take_snapshot(uint64_t applied_index,
+                         const std::vector<uint8_t> &state_snapshot) {
+  if (applied_index == 0 || applied_index <= log_offset_ ||
+      applied_index > last_applied_) {
     return;  // Nothing to snapshot
   }
 
-  // Get the term of the entry at last_applied_
-  uint64_t snap_term = log_entry(last_applied_).term;
+  uint64_t snap_term = term_at(applied_index);
 
   // Create snapshot metadata
-  wal::SnapshotMeta snap{last_applied_, snap_term, state_snapshot};
+  wal::SnapshotMeta snap{applied_index, snap_term, state_snapshot};
 
   // WAL-first: persist snapshot before truncating log
   if (wal_) {
     wal_->save_snapshot(snap);
-    wal_->sync();
+    if (!sync_wal()) {
+      return;
+    }
   }
 
-  // Truncate log: keep only entries > last_applied_
+  // Truncate log: keep only entries newer than the captured state.
   // Find array position of first entry to keep
   size_t keep_from = 0;
   for (size_t i = 0; i < log_.size(); ++i) {
-    if (log_[i].index > last_applied_) {
+    if (log_[i].index > applied_index) {
       keep_from = i;
       break;
     }
@@ -621,66 +764,71 @@ void Raft::take_snapshot(const std::vector<uint8_t>& state_snapshot) {
   // Erase everything before keep_from
   if (keep_from > 0) {
     log_.erase(log_.begin(), log_.begin() + keep_from);
-  } else if (!log_.empty() && log_.back().index <= last_applied_) {
+  } else if (!log_.empty() && log_.back().index <= applied_index) {
     // All entries are <= last_applied_, clear the entire log
     log_.clear();
   }
 
   // Update offset
-  log_offset_ = last_applied_;
-  last_snapshot_index_ = last_applied_;
+  log_offset_ = applied_index;
+  log_offset_term_ = snap_term;
+  last_snapshot_index_ = applied_index;
 
   // Cache snapshot data for InstallSnapshot RPC
   last_snapshot_data_ = state_snapshot;
 }
 
-// Push newly committed entries to lock-free apply queue
-// MUST be called with apply_mutex_ held
-void Raft::push_entries_to_apply_queue(uint64_t old_commit, uint64_t new_commit) {
-  // Push all entries in range (old_commit, new_commit]
-  for (uint64_t i = old_commit + 1; i <= new_commit; ++i) {
-    proto::Entry entry = log_entry(i); // Copy the entry
-
-    // Try to enqueue (non-blocking)
-    if (!apply_queue_->try_enqueue(std::move(entry))) {
-      // Queue is full - this indicates backpressure
-      // In production, we might want to:
-      // 1. Log a warning
-      // 2. Apply backpressure to clients (reject new writes)
-      // 3. Increase queue size
-      // For now, we'll just stop pushing and let apply thread catch up
-      break;
-    }
-  }
-}
-
 // ReadIndex: Initiate a linearizable read
-// Returns the commit index that should be applied before reading
-uint64_t Raft::read_index() {
+// Returns a token containing the quorum-round identity and applied-index fence.
+std::optional<ReadIndexToken> Raft::read_index() {
   // Only leader can serve ReadIndex
-  if (state_ != State::Leader) {
-    return 0; // Not leader, can't serve reads
+  if (state_ != State::Leader || storage_failed_) {
+    return std::nullopt;
   }
 
-  // Mark ReadIndex as pending
+  if (read_index_pending_) {
+    return ReadIndexToken{pending_read_context_, pending_read_index_};
+  }
+
   read_index_pending_ = true;
-  pending_read_index_ = commit_index_;
+  pending_read_context_ = next_read_context_++;
+  if (next_read_context_ == 0) {
+    next_read_context_ = 1;
+  }
   read_index_acks_.clear(); // Clear previous acks
 
-  // Send heartbeat to confirm leadership
-  broadcast_heartbeat();
+  if (!has_committed_entry_in_current_term()) {
+    pending_read_index_ = last_log_index() + 1;
+    if (!propose({}).has_value()) {
+      const ReadIndexToken failed{pending_read_context_, pending_read_index_};
+      finish_read_index(failed);
+      return std::nullopt;
+    }
+  } else {
+    pending_read_index_ = commit_index_;
+    broadcast_heartbeat();
+  }
 
-  return pending_read_index_;
+  return ReadIndexToken{pending_read_context_, pending_read_index_};
 }
 
 // Check if ReadIndex is confirmed (majority acked heartbeat)
-bool Raft::read_index_ready(uint64_t read_index) {
-  if (state_ != State::Leader) {
+bool Raft::read_index_ready(const ReadIndexToken &read) {
+  if (state_ != State::Leader || storage_failed_) {
     return false;
   }
 
   // If this is not the pending read request, it's stale
-  if (read_index != pending_read_index_) {
+  if (read.context != pending_read_context_ ||
+      read.safe_index != pending_read_index_) {
+    return false;
+  }
+
+  if (!has_committed_entry_in_current_term()) {
+    return false;
+  }
+
+  if (last_applied_ < read.safe_index) {
     return false;
   }
 
@@ -698,65 +846,15 @@ bool Raft::read_index_ready(uint64_t read_index) {
   return ack_count >= quorum;
 }
 
-// Start the async apply thread
-void Raft::start_apply_thread(std::function<void(uint64_t, const std::vector<uint8_t>&)> state_machine) {
-  // Check if already running
-  if (apply_thread_running_.load()) {
+void Raft::finish_read_index(const ReadIndexToken &read) {
+  if (read.context != pending_read_context_ ||
+      read.safe_index != pending_read_index_) {
     return;
   }
-
-  state_machine_apply_ = state_machine;
-  apply_thread_running_.store(true);
-
-  // Launch the apply thread
-  apply_thread_ = std::thread(&Raft::apply_thread_loop, this);
-}
-
-// Stop the async apply thread
-void Raft::stop_apply_thread() {
-  if (!apply_thread_running_.load()) {
-    return;
-  }
-
-  // Signal thread to stop
-  apply_thread_running_.store(false);
-
-  // Wait for thread to exit
-  if (apply_thread_.joinable()) {
-    apply_thread_.join();
-  }
-}
-
-// Apply thread main loop (consumer of lock-free queue)
-void Raft::apply_thread_loop() {
-  while (apply_thread_running_.load(std::memory_order_acquire)) {
-    // Try to dequeue an entry (non-blocking)
-    auto entry_opt = apply_queue_->try_dequeue();
-
-    if (!entry_opt.has_value()) {
-      // Queue is empty, sleep briefly to avoid busy-waiting
-      std::this_thread::sleep_for(std::chrono::microseconds(100));
-      continue;
-    }
-
-    // We have an entry to apply
-    proto::Entry entry = std::move(entry_opt.value());
-
-    // Apply to state machine (user-provided callback)
-    if (state_machine_apply_) {
-      state_machine_apply_(entry.index, entry.data);
-    }
-
-    // Update last_applied index
-    {
-      std::lock_guard<std::mutex> lock(apply_mutex_);
-      // Only update if this entry is the next one we expected
-      // (entries must be applied in order!)
-      if (entry.index == last_applied_ + 1) {
-        last_applied_ = entry.index;
-      }
-    }
-  }
+  read_index_pending_ = false;
+  pending_read_index_ = 0;
+  pending_read_context_ = 0;
+  read_index_acks_.clear();
 }
 
 // Handle InstallSnapshot RPC (follower receives snapshot from leader)
@@ -767,58 +865,66 @@ proto::Message Raft::handle_install_snapshot(const proto::Message &msg) {
   response.to = msg.from;
   response.success = false;
 
-  // Update term if leader's term is higher
-  if (msg.term > term_) {
-    become_follower(msg.term, msg.from);
-  }
-
-  // Reject if term is lower
-  if (msg.term < term_) {
+  if (!prepare_for_leader_rpc(msg)) {
     response.term = term_;
     return response;
   }
 
-  reset_randomized_election_timeout();
-  lead_ = msg.from;
-
   // Validate snapshot metadata
-  if (msg.snapshot_index == 0 || msg.snapshot_data.empty()) {
+  if (msg.snapshot_index == 0 || msg.snapshot_term == 0 ||
+      msg.snapshot_term > msg.term || msg.snapshot_data.empty()) {
     response.term = term_;
     return response; // Invalid snapshot
   }
 
-  // If we already have entries beyond this snapshot, we don't need it
-  // (This can happen if we received AppendEntries concurrently)
-  if (last_applied_ >= msg.snapshot_index) {
+  const uint64_t committed = commit_index_;
+  const uint64_t applied = last_applied_;
+
+  // A stale snapshot must never roll committed or applied state backward.
+  if (committed > msg.snapshot_index || applied >= msg.snapshot_index) {
     response.term = term_;
     response.success = true;
-    response.match_index = last_applied_;
+    response.match_index = std::max(committed, applied);
     return response;
   }
 
-  {
-    std::lock_guard<std::mutex> lock(apply_mutex_);
+  if (!snapshot_restore_) {
+    response.term = term_;
+    return response;
+  }
 
-    // WAL: persist snapshot before modifying state
-    if (wal_) {
-      wal::SnapshotMeta snap{msg.snapshot_index, msg.snapshot_term, msg.snapshot_data};
-      wal_->save_snapshot(snap);
-      wal_->sync();
+  if (!snapshot_restore_(msg.snapshot_index, msg.snapshot_data)) {
+    response.term = term_;
+    return response;
+  }
+
+  if (wal_) {
+    wal::SnapshotMeta snap{msg.snapshot_index, msg.snapshot_term,
+                           msg.snapshot_data, true};
+    wal_->save_snapshot(snap);
+    if (!sync_wal()) {
+      response.term = term_;
+      return response;
     }
+  }
 
-    // Discard entire log and replace with snapshot
-    log_.clear();
-    log_offset_ = msg.snapshot_index;
-    last_snapshot_index_ = msg.snapshot_index;
+  // Discard entire log and replace with snapshot
+  log_.clear();
+  log_offset_ = msg.snapshot_index;
+  log_offset_term_ = msg.snapshot_term;
+  last_snapshot_index_ = msg.snapshot_index;
+  last_snapshot_data_ = msg.snapshot_data;
 
-    // Update applied and commit indices
-    last_applied_ = msg.snapshot_index;
-    commit_index_ = msg.snapshot_index;
+  // Update applied and commit indices
+  last_applied_ = msg.snapshot_index;
+  commit_index_ = msg.snapshot_index;
 
-    // WAL: persist hard state after snapshot install
-    if (wal_) {
-      wal_->save_hard_state({term_, voted_for_, commit_index_});
-      wal_->sync();
+  // WAL: persist hard state after snapshot install
+  if (wal_) {
+    wal_->save_hard_state({term_, voted_for_, commit_index_});
+    if (!sync_wal()) {
+      response.term = term_;
+      return response;
     }
   }
 
@@ -831,16 +937,18 @@ proto::Message Raft::handle_install_snapshot(const proto::Message &msg) {
 
 // Handle InstallSnapshot response (leader receives confirmation)
 void Raft::handle_install_snapshot_response(const proto::Message &msg) {
+  if (msg.to != id_ || msg.from == id_ || !is_member(msg.from)) {
+    return;
+  }
+  if (msg.term > term_) {
+    become_follower(msg.term, 0);
+    return;
+  }
   if (state_ != State::Leader) {
     return;
   }
 
-  if (term_ > msg.term) {
-    return;
-  }
-
-  if (term_ < msg.term) {
-    become_follower(msg.term, 0);
+  if (msg.term < term_) {
     return;
   }
 

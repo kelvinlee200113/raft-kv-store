@@ -1,5 +1,7 @@
 #include <server/kv_store.h>
 
+#include <stdexcept>
+
 namespace kv {
 
 bool KVStore::get(const std::string &key, std::string &value) const {
@@ -15,32 +17,34 @@ void KVStore::set(const std::string &key, const std::string &value) {
   store_[key] = value;
 }
 
-void KVStore::del(const std::string &key) { store_.erase(key); }
+bool KVStore::del(const std::string &key) { return store_.erase(key) != 0; }
 
-void KVStore::apply(const proto::Entry &entry) {
-  // TODO: Implement deserialization
-
-  // Get the command
-
-  // 1. Entry.data is binary, need to unpack to msgpack::object via unpack()
+KVStore::ApplyResult KVStore::apply(const proto::Entry &entry) {
   msgpack::object_handle oh = msgpack::unpack(
       reinterpret_cast<const char *>(entry.data.data()), entry.data.size());
-  msgpack::object obj = oh.get();
+  Command cmd = oh.get().as<Command>();
 
-  // 2. Then call msgpack::as to call the implicit convert() to convert to
-  // desired command struct
-
-  Command cmd = obj.as<Command>();
-
-  // 3. Apply command to the store_ by calling one of get()/set()/del()
+  ApplyResult result{cmd.type, cmd.origin_node, cmd.request_id, 0,
+                     entry.index};
   if (cmd.type == CommandType::Set) {
-    // key = cmd.strs[0], value = cmd.strs[1]
-    set(cmd.strs[0], cmd.strs[1]);
-  } else if (cmd.type == CommandType::Del) {
-    for (const auto &key : cmd.strs) {
-      del(key);
+    if (cmd.strs.size() != 2) {
+      throw std::invalid_argument("SET command requires key and value");
     }
+    set(cmd.strs[0], cmd.strs[1]);
+    result.affected = 1;
+  } else if (cmd.type == CommandType::Del) {
+    if (cmd.strs.empty()) {
+      throw std::invalid_argument("DEL command requires at least one key");
+    }
+    for (const auto &key : cmd.strs) {
+      if (del(key)) {
+        ++result.affected;
+      }
+    }
+  } else {
+    throw std::invalid_argument("unknown KV command type");
   }
+  return result;
 }
 
 std::vector<uint8_t> KVStore::serialize() const {
@@ -54,7 +58,9 @@ std::vector<uint8_t> KVStore::serialize() const {
 void KVStore::deserialize(const std::vector<uint8_t>& data) {
   msgpack::object_handle oh = msgpack::unpack(
       reinterpret_cast<const char*>(data.data()), data.size());
-  oh.get().convert(store_);
+  std::unordered_map<std::string, std::string> restored;
+  oh.get().convert(restored);
+  store_.swap(restored);
 }
 
 } // namespace kv

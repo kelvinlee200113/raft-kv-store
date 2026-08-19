@@ -1,79 +1,105 @@
-cmake_minimum_required(VERSION 3.14)
-project(raft-kv)
+cmake_minimum_required(VERSION 3.20)
+project(raft-kv VERSION 0.1.0 LANGUAGES CXX)
 
-# Generate compile_commands.json for language servers (clangd, etc.)
+if(POLICY CMP0167)
+  cmake_policy(SET CMP0167 NEW)
+endif()
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Use C++17 standard
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# Find msgpack-cxx (header-only library for binary serialization)
+find_package(Boost REQUIRED COMPONENTS system)
+find_package(Threads REQUIRED)
 find_package(msgpack-cxx REQUIRED)
 
-# Include directories
-include_directories(src)
-# Add msgpack include directory (typically /opt/homebrew/include on macOS)
-include_directories(/opt/homebrew/include)
+set(RAFT_SANITIZER "" CACHE STRING
+    "Enable a sanitizer: address, undefined, or thread")
+set_property(CACHE RAFT_SANITIZER PROPERTY STRINGS
+             "" address undefined thread)
+option(RAFT_ENABLE_COVERAGE "Enable LLVM source coverage" OFF)
 
-# Create raft library (compile once, link many times)
+if(RAFT_SANITIZER AND RAFT_ENABLE_COVERAGE)
+  message(FATAL_ERROR "Sanitizers and coverage require separate builds")
+endif()
+
+add_library(raft_instrumentation INTERFACE)
+
+if(RAFT_SANITIZER)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(AppleClang|Clang|GNU)$")
+    message(FATAL_ERROR "RAFT_SANITIZER requires Clang or GCC")
+  endif()
+  if(NOT RAFT_SANITIZER MATCHES "^(address|undefined|thread)$")
+    message(FATAL_ERROR "Unknown RAFT_SANITIZER=${RAFT_SANITIZER}")
+  endif()
+
+  target_compile_options(raft_instrumentation INTERFACE
+      -fsanitize=${RAFT_SANITIZER}
+      -fno-omit-frame-pointer)
+  target_link_options(raft_instrumentation INTERFACE
+      -fsanitize=${RAFT_SANITIZER})
+endif()
+
+if(RAFT_ENABLE_COVERAGE)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(AppleClang|Clang)$")
+    message(FATAL_ERROR "RAFT_ENABLE_COVERAGE requires Clang")
+  endif()
+
+  target_compile_options(raft_instrumentation INTERFACE
+      -O0
+      -g
+      -fprofile-instr-generate
+      -fcoverage-mapping)
+  target_link_options(raft_instrumentation INTERFACE
+      -fprofile-instr-generate)
+endif()
+
 add_library(raft_lib STATIC
+    src/common/bytebuffer.cpp
     src/raft/raft.cpp
     src/server/kv_store.cpp
-    src/common/bytebuffer.cpp
+    src/server/resp_codec.cpp
+    src/server/resp_server.cpp
     src/transport/peer.cpp
     src/transport/server.cpp
     src/wal/wal.cpp
 )
-
-# Add the main executable
-add_executable(raft-kv
-    src/main.cpp
+target_include_directories(raft_lib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(raft_lib PUBLIC
+    raft_instrumentation
+    Boost::system
+    Threads::Threads
+    msgpack-cxx)
+target_compile_options(raft_lib PRIVATE
+    $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wall;-Wextra;-Wpedantic>
 )
-target_link_libraries(raft-kv raft_lib)
 
-# Find Google Test
-find_package(GTest REQUIRED)
-include_directories(${GTEST_INCLUDE_DIRS})
+add_executable(raft-kv src/main.cpp src/app/node_runtime.cpp)
+target_link_libraries(raft-kv PRIVATE raft_lib)
+target_compile_options(raft-kv PRIVATE
+    $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wall;-Wextra;-Wpedantic>
+)
 
-# Enable testing
-enable_testing()
+include(CTest)
+if(BUILD_TESTING)
+  find_package(GTest REQUIRED)
 
-# Add tests
-add_executable(voting_test tests/voting_test.cpp)
-target_link_libraries(voting_test raft_lib GTest::gtest GTest::gtest_main)
-add_test(NAME VotingTest COMMAND voting_test)
+  function(add_raft_test target source)
+    add_executable(${target} ${source})
+    target_link_libraries(${target} PRIVATE raft_lib GTest::gtest_main)
+    add_test(NAME ${target} COMMAND ${target})
+  endfunction()
 
-add_executable(replication_test tests/replication_test.cpp)
-target_link_libraries(replication_test raft_lib GTest::gtest GTest::gtest_main)
-add_test(NAME ReplicationTest COMMAND replication_test)
-
-add_executable(kv_store_test tests/kv_store_test.cpp)
-target_link_libraries(kv_store_test raft_lib GTest::gtest GTest::gtest_main)
-add_test(NAME KVStoreTest COMMAND kv_store_test)
-
-add_executable(transport_proto_test tests/transport_proto_test.cpp)
-target_link_libraries(transport_proto_test raft_lib GTest::gtest GTest::gtest_main)
-add_test(NAME TransportProtoTest COMMAND transport_proto_test)
-
-add_executable(network_test tests/network_test.cpp)
-target_link_libraries(network_test raft_lib GTest::gtest GTest::gtest_main)
-add_test(NAME NetworkTest COMMAND network_test)
-
-add_executable(read_index_test tests/read_index_test.cpp)
-target_link_libraries(read_index_test raft_lib GTest::gtest GTest::gtest_main)
-add_test(NAME ReadIndexTest COMMAND read_index_test)
-
-add_executable(async_apply_test tests/async_apply_test.cpp)
-target_link_libraries(async_apply_test raft_lib GTest::gtest GTest::gtest_main)
-add_test(NAME AsyncApplyTest COMMAND async_apply_test)
-
-add_executable(lock_free_queue_test tests/lock_free_queue_test.cpp)
-target_link_libraries(lock_free_queue_test raft_lib GTest::gtest GTest::gtest_main)
-add_test(NAME LockFreeQueueTest COMMAND lock_free_queue_test)
-
-add_executable(wal_test tests/wal_test.cpp)
-target_link_libraries(wal_test raft_lib GTest::gtest GTest::gtest_main)
-add_test(NAME WALTest COMMAND wal_test)
-
-
+  add_raft_test(voting_test tests/voting_test.cpp)
+  add_raft_test(replication_test tests/replication_test.cpp)
+  add_raft_test(kv_store_test tests/kv_store_test.cpp)
+  add_raft_test(transport_proto_test tests/transport_proto_test.cpp)
+  add_raft_test(network_test tests/network_test.cpp)
+  add_raft_test(read_index_test tests/read_index_test.cpp)
+  add_raft_test(async_apply_test tests/async_apply_test.cpp)
+  add_raft_test(wal_test tests/wal_test.cpp)
+  add_raft_test(snapshot_test tests/snapshot_test.cpp)
+  add_raft_test(resp_codec_test tests/resp_codec_test.cpp)
+  add_raft_test(resp_server_test tests/resp_server_test.cpp)
+endif()

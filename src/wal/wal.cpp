@@ -7,6 +7,8 @@
 #include <cstring>
 #include <iostream>
 #include <inttypes.h>
+#include <fcntl.h>
+#include <stdexcept>
 
 namespace kv {
 namespace wal {
@@ -138,8 +140,7 @@ std::vector<std::string> WAL::list_wal_files(const std::string& dir) {
 // ---------------------------------------------------------------------------
 // Constructor / Destructor
 // ---------------------------------------------------------------------------
-WAL::WAL(const std::string& dir, FILE* fp, uint64_t seq)
-    : dir_(dir), fp_(fp), seq_(seq) {}
+WAL::WAL(const std::string& dir, FILE* fp) : dir_(dir), fp_(fp) {}
 
 WAL::~WAL() {
   if (fp_) {
@@ -159,13 +160,24 @@ std::unique_ptr<WAL> WAL::create(const std::string& dir) {
   }
 
   std::string path = dir + "/" + make_wal_name(0, 0);
-  FILE* fp = fopen(path.c_str(), "wb");
+  const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+  if (fd < 0) {
+    std::cerr << "[WAL] create failed: " << path << " (" << strerror(errno)
+              << ")" << std::endl;
+    return nullptr;
+  }
+  FILE* fp = fdopen(fd, "wb");
   if (!fp) {
-    std::cerr << "[WAL] fopen failed: " << path << " (" << strerror(errno) << ")" << std::endl;
+    const int saved_errno = errno;
+    close(fd);
+    unlink(path.c_str());
+    errno = saved_errno;
+    std::cerr << "[WAL] fdopen failed: " << path << " (" << strerror(errno)
+              << ")" << std::endl;
     return nullptr;
   }
 
-  return std::unique_ptr<WAL>(new WAL(dir, fp, 0));
+  return std::unique_ptr<WAL>(new WAL(dir, fp));
 }
 
 // ---------------------------------------------------------------------------
@@ -193,13 +205,17 @@ std::unique_ptr<WAL> WAL::open(const std::string& dir) {
     return nullptr;
   }
 
-  return std::unique_ptr<WAL>(new WAL(dir, fp, seq));
+  return std::unique_ptr<WAL>(new WAL(dir, fp));
 }
 
 // ---------------------------------------------------------------------------
 // Write path: append_record → buffer; sync → fwrite + fsync
 // ---------------------------------------------------------------------------
 void WAL::append_record(RecordType type, const uint8_t* data, size_t len) {
+  constexpr std::size_t kMaxRecordPayload = (1U << 24U) - 1U;
+  if (len > kMaxRecordPayload) {
+    throw std::length_error("WAL record exceeds the 24-bit payload limit");
+  }
   uint32_t checksum = crc32(data, len);
   RecordHeader hdr(static_cast<uint8_t>(type), static_cast<uint32_t>(len), checksum);
   hdr.encode(buffer_);                                  // 8 bytes header
@@ -235,20 +251,36 @@ void WAL::save_snapshot(const SnapshotMeta& snap) {
 }
 
 bool WAL::sync() {
+  if (failed_) return false;
   if (buffer_.empty()) return true;
 
   size_t written = fwrite(buffer_.data(), 1, buffer_.size(), fp_);
   if (written != buffer_.size()) {
     std::cerr << "[WAL] fwrite short write: " << written << "/" << buffer_.size()
               << " (" << strerror(errno) << ")" << std::endl;
+    failed_ = true;
+    buffer_.clear();
     return false;
   }
-  buffer_.clear();
+
+  // fwrite may only reach stdio's userspace buffer. Flush that buffer before
+  // asking the kernel to make the file durable; otherwise fsync can succeed
+  // while an abrupt process exit still loses the acknowledged record.
+  if (fflush(fp_) != 0) {
+    std::cerr << "[WAL] fflush failed (" << strerror(errno) << ")"
+              << std::endl;
+    failed_ = true;
+    buffer_.clear();
+    return false;
+  }
 
   if (fsync(fileno(fp_)) != 0) {
     std::cerr << "[WAL] fsync failed (" << strerror(errno) << ")" << std::endl;
+    failed_ = true;
+    buffer_.clear();
     return false;
   }
+  buffer_.clear();
   return true;
 }
 
@@ -258,13 +290,21 @@ bool WAL::sync() {
 HardStateProto WAL::recover(std::vector<proto::Entry>& entries, SnapshotMeta* snapshot) {
   HardStateProto hs;
   auto names = list_wal_files(dir_);
+  if (names.empty()) {
+    throw std::runtime_error("no WAL files available for recovery in " + dir_);
+  }
+  bool stop_recovery = false;
 
   for (const std::string& name : names) {
+    if (stop_recovery) {
+      break;
+    }
     std::string path = dir_ + "/" + name;
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) {
-      std::cerr << "[WAL] recover: cannot open " << path << std::endl;
-      continue;
+      const int open_errno = errno;
+      throw std::runtime_error("cannot open WAL file " + path + ": " +
+                               strerror(open_errno));
     }
 
     // Read entire file into memory
@@ -272,35 +312,52 @@ HardStateProto WAL::recover(std::vector<proto::Entry>& entries, SnapshotMeta* sn
     uint8_t chunk[4096];
     while (true) {
       size_t n = fread(chunk, 1, sizeof(chunk), f);
-      if (n == 0) break;
       data.insert(data.end(), chunk, chunk + n);
+      if (n < sizeof(chunk)) {
+        if (ferror(f)) {
+          const int read_errno = errno;
+          fclose(f);
+          throw std::runtime_error("cannot read WAL file " + path + ": " +
+                                   strerror(read_errno));
+        }
+        break;
+      }
     }
     fclose(f);
 
     // Parse records sequentially
     size_t offset = 0;
+    size_t valid_bytes = 0;
+    bool damaged_tail = false;
     while (offset < data.size()) {
+      const size_t record_start = offset;
       // Need at least a full header
       if (data.size() - offset < 8) {
+        damaged_tail = true;
         break;  // truncated header → stop (crash during header write)
       }
 
       RecordHeader hdr = RecordHeader::decode(data.data() + offset);
       offset += 8;
 
-      // Invalid type → stop (zeroed-out region from incomplete write)
-      if (hdr.type == RecordType::Invalid) {
+      const bool supported_type =
+          hdr.type == RecordType::Entry || hdr.type == RecordType::HardState ||
+          hdr.type == RecordType::Snapshot;
+      if (!supported_type) {
+        damaged_tail = true;
         break;
       }
 
       // Not enough data for the payload → stop (crash during payload write)
       if (data.size() - offset < hdr.len) {
+        damaged_tail = true;
         break;
       }
 
       // Validate CRC
       uint32_t computed = crc32(data.data() + offset, hdr.len);
       if (computed != hdr.crc) {
+        damaged_tail = true;
         break;  // CRC mismatch → corrupted record, stop here
       }
 
@@ -308,33 +365,88 @@ HardStateProto WAL::recover(std::vector<proto::Entry>& entries, SnapshotMeta* sn
       const uint8_t* payload = data.data() + offset;
       offset += hdr.len;
 
-      switch (static_cast<RecordType>(hdr.type)) {
-        case RecordType::HardState: {
-          msgpack::object_handle oh = msgpack::unpack(
-              reinterpret_cast<const char*>(payload), hdr.len);
-          oh.get().convert(hs);
-          break;
-        }
-        case RecordType::Entry: {
-          proto::Entry entry;
-          msgpack::object_handle oh = msgpack::unpack(
-              reinterpret_cast<const char*>(payload), hdr.len);
-          oh.get().convert(entry);
-          entries.push_back(std::move(entry));
-          break;
-        }
-        case RecordType::Snapshot: {
-          if (snapshot) {
+      try {
+        switch (static_cast<RecordType>(hdr.type)) {
+          case RecordType::HardState: {
             msgpack::object_handle oh = msgpack::unpack(
                 reinterpret_cast<const char*>(payload), hdr.len);
-            oh.get().convert(*snapshot);
+            oh.get().convert(hs);
+            break;
           }
-          break;
+          case RecordType::Entry: {
+            proto::Entry entry;
+            msgpack::object_handle oh = msgpack::unpack(
+                reinterpret_cast<const char*>(payload), hdr.len);
+            oh.get().convert(entry);
+
+            auto replacement = std::lower_bound(
+                entries.begin(), entries.end(), entry.index,
+                [](const proto::Entry &existing, uint64_t index) {
+                  return existing.index < index;
+                });
+            if (replacement != entries.end()) {
+              entries.erase(replacement, entries.end());
+            }
+            entries.push_back(std::move(entry));
+            break;
+          }
+          case RecordType::Snapshot: {
+            SnapshotMeta recovered_snapshot;
+            msgpack::object_handle oh = msgpack::unpack(
+                reinterpret_cast<const char *>(payload), hdr.len);
+            oh.get().convert(recovered_snapshot);
+
+            if (recovered_snapshot.discard_suffix) {
+              entries.clear();
+            } else {
+              entries.erase(
+                  entries.begin(),
+                  std::upper_bound(
+                      entries.begin(), entries.end(), recovered_snapshot.index,
+                      [](uint64_t index, const proto::Entry &entry) {
+                        return index < entry.index;
+                      }));
+            }
+            if (snapshot) {
+              *snapshot = std::move(recovered_snapshot);
+            }
+            break;
+          }
+          default:
+            break;
         }
-        default:
-          // Skip unknown record types (e.g. CRCRecord)
-          break;
+      } catch (const std::exception &error) {
+        std::cerr << "[WAL] recover: invalid record at byte " << record_start
+                  << " in " << path << ": " << error.what() << std::endl;
+        damaged_tail = true;
+        break;
       }
+
+      valid_bytes = offset;
+    }
+
+    if (damaged_tail) {
+      const int repair_fd = ::open(path.c_str(), O_WRONLY);
+      bool repaired = repair_fd >= 0;
+      int repair_errno = repair_fd < 0 ? errno : 0;
+      if (repaired &&
+          ftruncate(repair_fd, static_cast<off_t>(valid_bytes)) != 0) {
+        repaired = false;
+        repair_errno = errno;
+      }
+      if (repaired && fsync(repair_fd) != 0) {
+        repaired = false;
+        repair_errno = errno;
+      }
+      if (repair_fd >= 0) {
+        close(repair_fd);
+      }
+      if (!repaired) {
+        throw std::runtime_error(
+            "failed to repair damaged WAL tail in " + path + ": " +
+            strerror(repair_errno));
+      }
+      stop_recovery = true;
     }
   }
 

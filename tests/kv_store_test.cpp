@@ -112,6 +112,17 @@ TEST(KVStoreTest, OverwriteExistingKey) {
   EXPECT_EQ(value, "2");
 }
 
+TEST(KVStoreTest, InvalidSnapshotDoesNotReplaceCurrentState) {
+  KVStore store;
+  store.set("stable", "value");
+
+  EXPECT_THROW(store.deserialize({0xc1}), std::exception);
+
+  std::string value;
+  ASSERT_TRUE(store.get("stable", value));
+  EXPECT_EQ(value, "value");
+}
+
 // Test apply() method with Raft integration
 TEST(KVStoreTest, ApplySetCommand) {
   KVStore store;
@@ -207,4 +218,51 @@ TEST(KVStoreTest, MultipleOperations) {
     EXPECT_TRUE(found);
     EXPECT_EQ(value, "value" + std::to_string(i));
   }
+}
+
+TEST(KVStoreTest, ApplyReturnsRequestIdentityAndDeleteCount) {
+  KVStore store;
+  store.set("present", "value");
+
+  Command command;
+  command.type = CommandType::Del;
+  command.strs = {"present", "missing"};
+  command.origin_node = 2;
+  command.request_id = 99;
+
+  msgpack::sbuffer buffer;
+  msgpack::pack(buffer, command);
+  proto::Entry entry;
+  entry.index = 7;
+  entry.term = 3;
+  entry.data.assign(buffer.data(), buffer.data() + buffer.size());
+
+  const auto result = store.apply(entry);
+
+  EXPECT_EQ(result.origin_node, 2u);
+  EXPECT_EQ(result.request_id, 99u);
+  EXPECT_EQ(result.affected, 1u);
+  EXPECT_EQ(result.applied_index, 7u);
+}
+
+TEST(KVStoreTest, AppliesLegacyTwoFieldCommandFromExistingWal) {
+  msgpack::sbuffer buffer;
+  msgpack::packer<msgpack::sbuffer> packer(buffer);
+  packer.pack_array(2);
+  packer.pack(static_cast<uint8_t>(CommandType::Set));
+  packer.pack(std::vector<std::string>{"legacy", "value"});
+
+  proto::Entry entry;
+  entry.index = 1;
+  entry.term = 1;
+  entry.data.assign(buffer.data(), buffer.data() + buffer.size());
+
+  KVStore store;
+  const auto result = store.apply(entry);
+
+  std::string value;
+  ASSERT_TRUE(store.get("legacy", value));
+  EXPECT_EQ(value, "value");
+  EXPECT_EQ(result.origin_node, 0u);
+  EXPECT_EQ(result.request_id, 0u);
 }

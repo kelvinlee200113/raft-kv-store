@@ -6,6 +6,10 @@
 #include <vector>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 // ---------------------------------------------------------------------------
 // Fixture: creates a unique temp directory per test, removes it on teardown
@@ -15,16 +19,20 @@ protected:
   std::string dir_;
 
   void SetUp() override {
-    // Each test gets its own directory so tests are fully isolated
-    dir_ = std::string("/tmp/wal_test_") + GetCurrentTestName();
-    // Clean any leftover from a previous crashed run
-    std::string rm_cmd = "rm -rf " + dir_;
-    system(rm_cmd.c_str());
+    const auto directory = std::string("raft-kv-wal-test-") +
+                           std::to_string(static_cast<long long>(getpid())) +
+                           "-" + GetCurrentTestName();
+    dir_ = (std::filesystem::temp_directory_path() / directory).string();
+
+    std::error_code error;
+    std::filesystem::remove_all(dir_, error);
+    ASSERT_FALSE(error) << error.message();
   }
 
   void TearDown() override {
-    std::string rm_cmd = "rm -rf " + dir_;
-    system(rm_cmd.c_str());
+    std::error_code error;
+    std::filesystem::remove_all(dir_, error);
+    EXPECT_FALSE(error) << error.message();
   }
 
 private:
@@ -290,8 +298,8 @@ TEST_F(WALTest, LastSnapshotWins) {
 }
 
 // ---------------------------------------------------------------------------
-// Test 8: Realistic recovery: entries before snapshot, snapshot, entries after.
-//         All records come back; caller filters entries > snapshot.index.
+// Test 8: Realistic recovery: a local snapshot compacts its covered prefix and
+//         retains entries appended after the snapshot.
 // ---------------------------------------------------------------------------
 TEST_F(WALTest, SnapshotWithEntriesAndHardState) {
   auto w = kv::wal::WAL::create(dir_);
@@ -341,19 +349,312 @@ TEST_F(WALTest, SnapshotWithEntriesAndHardState) {
   EXPECT_EQ(snap.term,  1u);
   EXPECT_EQ(snap.state, (std::vector<uint8_t>{0xDE, 0xAD}));
 
-  // All 5 entries come back raw — caller is responsible for skipping <= snap.index
-  ASSERT_EQ(entries.size(), 5u);
+  ASSERT_EQ(entries.size(), 2u);
+  EXPECT_EQ(entries[0].index, 4u);
+  EXPECT_EQ(entries[0].data,  (std::vector<uint8_t>{40}));
+  EXPECT_EQ(entries[1].index, 5u);
+  EXPECT_EQ(entries[1].data,  (std::vector<uint8_t>{50}));
+}
 
-  // Simulate what main.cpp would do: only replay entries after snapshot
-  std::vector<kv::proto::Entry> to_replay;
-  for (const auto& e : entries) {
-    if (e.index > snap.index) {
-      to_replay.push_back(e);
-    }
+TEST_F(WALTest, InstalledSnapshotDiscardsThePriorLocalSuffix) {
+  auto wal = kv::wal::WAL::create(dir_);
+  ASSERT_NE(wal, nullptr);
+  for (uint64_t index = 1; index <= 5; ++index) {
+    kv::proto::Entry entry;
+    entry.index = index;
+    entry.term = 1;
+    entry.data = {static_cast<uint8_t>(index)};
+    wal->save_entry(entry);
   }
-  ASSERT_EQ(to_replay.size(), 2u);
-  EXPECT_EQ(to_replay[0].index, 4u);
-  EXPECT_EQ(to_replay[0].data,  (std::vector<uint8_t>{40}));
-  EXPECT_EQ(to_replay[1].index, 5u);
-  EXPECT_EQ(to_replay[1].data,  (std::vector<uint8_t>{50}));
+  wal->save_snapshot(kv::wal::SnapshotMeta{3, 2, {9}, true});
+
+  kv::proto::Entry replacement;
+  replacement.index = 4;
+  replacement.term = 2;
+  replacement.data = {44};
+  wal->save_entry(replacement);
+  ASSERT_TRUE(wal->sync());
+  wal.reset();
+
+  auto reopened = kv::wal::WAL::open(dir_);
+  ASSERT_NE(reopened, nullptr);
+  std::vector<kv::proto::Entry> entries;
+  kv::wal::SnapshotMeta snapshot;
+  reopened->recover(entries, &snapshot);
+
+  EXPECT_TRUE(snapshot.discard_suffix);
+  ASSERT_EQ(entries.size(), 1u);
+  EXPECT_EQ(entries.front().index, 4u);
+  EXPECT_EQ(entries.front().term, 2u);
+  EXPECT_EQ(entries.front().data, (std::vector<uint8_t>{44}));
+}
+
+TEST_F(WALTest, ReplacementEntryTruncatesRecoveredSuffix) {
+  auto wal = kv::wal::WAL::create(dir_);
+  ASSERT_NE(wal, nullptr);
+
+  for (uint64_t index = 1; index <= 3; ++index) {
+    kv::proto::Entry entry;
+    entry.index = index;
+    entry.term = 1;
+    entry.data = {static_cast<uint8_t>(index)};
+    wal->save_entry(entry);
+  }
+  ASSERT_TRUE(wal->sync());
+
+  for (uint64_t index = 2; index <= 3; ++index) {
+    kv::proto::Entry replacement;
+    replacement.index = index;
+    replacement.term = 2;
+    replacement.data = {static_cast<uint8_t>(index + 10)};
+    wal->save_entry(replacement);
+  }
+  ASSERT_TRUE(wal->sync());
+  wal.reset();
+
+  auto reopened = kv::wal::WAL::open(dir_);
+  ASSERT_NE(reopened, nullptr);
+  std::vector<kv::proto::Entry> recovered;
+  reopened->recover(recovered);
+
+  ASSERT_EQ(recovered.size(), 3u);
+  EXPECT_EQ(recovered[0].index, 1u);
+  EXPECT_EQ(recovered[0].term, 1u);
+  EXPECT_EQ(recovered[1].index, 2u);
+  EXPECT_EQ(recovered[1].term, 2u);
+  EXPECT_EQ(recovered[1].data, (std::vector<uint8_t>{12}));
+  EXPECT_EQ(recovered[2].index, 3u);
+  EXPECT_EQ(recovered[2].term, 2u);
+  EXPECT_EQ(recovered[2].data, (std::vector<uint8_t>{13}));
+}
+
+TEST_F(WALTest, RecoveryTruncatesTornTailBeforeFutureAppend) {
+  const std::string wal_path =
+      dir_ + "/0000000000000000-0000000000000000.wal";
+
+  auto wal = kv::wal::WAL::create(dir_);
+  ASSERT_NE(wal, nullptr);
+  kv::proto::Entry first;
+  first.index = 1;
+  first.term = 1;
+  first.data = {1};
+  wal->save_entry(first);
+  ASSERT_TRUE(wal->sync());
+  wal.reset();
+
+  FILE *file = fopen(wal_path.c_str(), "ab");
+  ASSERT_NE(file, nullptr);
+  const uint8_t torn_header[] = {2, 4, 0};
+  ASSERT_EQ(fwrite(torn_header, 1, sizeof(torn_header), file),
+            sizeof(torn_header));
+  fclose(file);
+
+  auto reopened = kv::wal::WAL::open(dir_);
+  ASSERT_NE(reopened, nullptr);
+  std::vector<kv::proto::Entry> first_recovery;
+  reopened->recover(first_recovery);
+  ASSERT_EQ(first_recovery.size(), 1u);
+
+  kv::proto::Entry second;
+  second.index = 2;
+  second.term = 1;
+  second.data = {2};
+  reopened->save_entry(second);
+  ASSERT_TRUE(reopened->sync());
+  reopened.reset();
+
+  auto final_open = kv::wal::WAL::open(dir_);
+  ASSERT_NE(final_open, nullptr);
+  std::vector<kv::proto::Entry> final_recovery;
+  final_open->recover(final_recovery);
+
+  ASSERT_EQ(final_recovery.size(), 2u);
+  EXPECT_EQ(final_recovery[0].index, 1u);
+  EXPECT_EQ(final_recovery[1].index, 2u);
+}
+
+TEST_F(WALTest, CreateNeverOverwritesAnExistingWal) {
+  auto wal = kv::wal::WAL::create(dir_);
+  ASSERT_NE(wal, nullptr);
+  kv::proto::Entry entry;
+  entry.index = 1;
+  entry.term = 1;
+  entry.data = {42};
+  wal->save_entry(entry);
+  ASSERT_TRUE(wal->sync());
+  wal.reset();
+
+  EXPECT_EQ(kv::wal::WAL::create(dir_), nullptr);
+
+  auto reopened = kv::wal::WAL::open(dir_);
+  ASSERT_NE(reopened, nullptr);
+  std::vector<kv::proto::Entry> recovered;
+  reopened->recover(recovered);
+  ASSERT_EQ(recovered.size(), 1u);
+  EXPECT_EQ(recovered.front().data, (std::vector<uint8_t>{42}));
+}
+
+TEST_F(WALTest, UnknownRecordTypeIsTreatedAsDamagedTail) {
+  const std::string wal_path =
+      dir_ + "/0000000000000000-0000000000000000.wal";
+  auto wal = kv::wal::WAL::create(dir_);
+  ASSERT_NE(wal, nullptr);
+  kv::proto::Entry entry;
+  entry.index = 1;
+  entry.term = 1;
+  entry.data = {1};
+  wal->save_entry(entry);
+  ASSERT_TRUE(wal->sync());
+  wal.reset();
+
+  FILE *file = fopen(wal_path.c_str(), "r+b");
+  ASSERT_NE(file, nullptr);
+  ASSERT_EQ(fputc(99, file), 99);
+  fclose(file);
+
+  auto reopened = kv::wal::WAL::open(dir_);
+  ASSERT_NE(reopened, nullptr);
+  std::vector<kv::proto::Entry> recovered;
+  reopened->recover(recovered);
+  EXPECT_TRUE(recovered.empty());
+
+  kv::proto::Entry replacement;
+  replacement.index = 1;
+  replacement.term = 2;
+  replacement.data = {2};
+  reopened->save_entry(replacement);
+  ASSERT_TRUE(reopened->sync());
+  reopened.reset();
+
+  auto final_open = kv::wal::WAL::open(dir_);
+  ASSERT_NE(final_open, nullptr);
+  final_open->recover(recovered);
+  ASSERT_EQ(recovered.size(), 1u);
+  EXPECT_EQ(recovered.front().term, 2u);
+}
+
+TEST_F(WALTest, OversizedSnapshotIsRejectedWithoutPoisoningTheWal) {
+  auto wal = kv::wal::WAL::create(dir_);
+  ASSERT_NE(wal, nullptr);
+  kv::wal::SnapshotMeta oversized{
+      1, 1, std::vector<uint8_t>(1U << 24U, static_cast<uint8_t>(7))};
+
+  EXPECT_THROW(wal->save_snapshot(oversized), std::length_error);
+
+  kv::proto::Entry entry;
+  entry.index = 1;
+  entry.term = 1;
+  entry.data = {9};
+  wal->save_entry(entry);
+  ASSERT_TRUE(wal->sync());
+  wal.reset();
+
+  auto reopened = kv::wal::WAL::open(dir_);
+  ASSERT_NE(reopened, nullptr);
+  std::vector<kv::proto::Entry> recovered;
+  kv::wal::SnapshotMeta snapshot;
+  reopened->recover(recovered, &snapshot);
+  EXPECT_TRUE(snapshot.is_empty());
+  ASSERT_EQ(recovered.size(), 1u);
+  EXPECT_EQ(recovered.front().data, (std::vector<uint8_t>{9}));
+}
+
+TEST_F(WALTest, LegacyThreeFieldSnapshotDefaultsToRetainingItsSuffix) {
+  msgpack::sbuffer buffer;
+  msgpack::packer<msgpack::sbuffer> packer(buffer);
+  packer.pack_array(3);
+  packer.pack(static_cast<uint64_t>(7));
+  packer.pack(static_cast<uint64_t>(2));
+  packer.pack(std::vector<uint8_t>{9});
+
+  const auto object = msgpack::unpack(buffer.data(), buffer.size());
+  const auto snapshot = object.get().as<kv::wal::SnapshotMeta>();
+
+  EXPECT_EQ(snapshot.index, 7u);
+  EXPECT_EQ(snapshot.term, 2u);
+  EXPECT_FALSE(snapshot.discard_suffix);
+}
+
+TEST_F(WALTest, SyncSurvivesAbruptProcessExitWithoutFclose) {
+  const pid_t child = fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    auto wal = kv::wal::WAL::create(dir_);
+    if (!wal) {
+      _exit(2);
+    }
+    kv::proto::Entry entry;
+    entry.index = 1;
+    entry.term = 1;
+    entry.data = {42};
+    wal->save_entry(entry);
+    if (!wal->sync()) {
+      _exit(3);
+    }
+    _exit(0);
+  }
+
+  int status = 0;
+  ASSERT_EQ(waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status));
+  ASSERT_EQ(WEXITSTATUS(status), 0);
+
+  auto reopened = kv::wal::WAL::open(dir_);
+  ASSERT_NE(reopened, nullptr);
+  std::vector<kv::proto::Entry> recovered;
+  reopened->recover(recovered);
+  ASSERT_EQ(recovered.size(), 1u);
+  EXPECT_EQ(recovered.front().index, 1u);
+  EXPECT_EQ(recovered.front().data, (std::vector<uint8_t>{42}));
+}
+
+TEST_F(WALTest, RecoveryFailsClosedWhenDamagedTailCannotBeRepaired) {
+  const std::string wal_path =
+      dir_ + "/0000000000000000-0000000000000000.wal";
+  auto wal = kv::wal::WAL::create(dir_);
+  ASSERT_NE(wal, nullptr);
+  kv::proto::Entry entry;
+  entry.index = 1;
+  entry.term = 1;
+  entry.data = {1};
+  wal->save_entry(entry);
+  ASSERT_TRUE(wal->sync());
+  wal.reset();
+
+  FILE *file = fopen(wal_path.c_str(), "ab");
+  ASSERT_NE(file, nullptr);
+  const uint8_t torn[] = {1, 2, 3};
+  ASSERT_EQ(fwrite(torn, 1, sizeof(torn), file), sizeof(torn));
+  fclose(file);
+
+  auto reopened = kv::wal::WAL::open(dir_);
+  ASSERT_NE(reopened, nullptr);
+  ASSERT_EQ(chmod(wal_path.c_str(), 0444), 0);
+  std::vector<kv::proto::Entry> recovered;
+  EXPECT_THROW(reopened->recover(recovered), std::runtime_error);
+  EXPECT_EQ(chmod(wal_path.c_str(), 0644), 0);
+}
+
+TEST_F(WALTest, RecoveryFailsClosedWhenExistingWalDisappears) {
+  const std::string wal_path =
+      dir_ + "/0000000000000000-0000000000000000.wal";
+  const std::string moved_path = wal_path + ".missing";
+
+  auto wal = kv::wal::WAL::create(dir_);
+  ASSERT_NE(wal, nullptr);
+  wal->save_hard_state({3, 2, 1});
+  kv::proto::Entry entry;
+  entry.index = 1;
+  entry.term = 3;
+  entry.data = {42};
+  wal->save_entry(entry);
+  ASSERT_TRUE(wal->sync());
+  wal.reset();
+
+  auto reopened = kv::wal::WAL::open(dir_);
+  ASSERT_NE(reopened, nullptr);
+  ASSERT_EQ(::rename(wal_path.c_str(), moved_path.c_str()), 0);
+
+  std::vector<kv::proto::Entry> recovered;
+  EXPECT_THROW(reopened->recover(recovered), std::runtime_error);
 }

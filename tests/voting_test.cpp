@@ -2,6 +2,8 @@
 #include <raft/config.h>
 #include <raft/raft.h>
 
+#include <algorithm>
+
 // Test fixture for Raft voting tests
 class RaftVotingTest : public ::testing::Test {
 protected:
@@ -15,6 +17,26 @@ protected:
 
   kv::Config config;
 };
+
+TEST(RaftConfigurationTest, RejectsMembershipThatIsNotExactlyThreeNodes) {
+  kv::Config two_nodes;
+  two_nodes.id = 1;
+  two_nodes.peers = {1, 2};
+  EXPECT_THROW(kv::Raft raft(two_nodes), std::invalid_argument);
+
+  kv::Config four_nodes;
+  four_nodes.id = 1;
+  four_nodes.peers = {1, 2, 3, 4};
+  EXPECT_THROW(kv::Raft raft(four_nodes), std::invalid_argument);
+}
+
+TEST(RaftConfigurationTest, RejectsZeroAsAMemberIdentity) {
+  kv::Config config;
+  config.id = 1;
+  config.peers = {0, 1, 2};
+
+  EXPECT_THROW(kv::Raft raft(config), std::invalid_argument);
+}
 
 // Test: Node becomes candidate and increments term
 TEST_F(RaftVotingTest, BecomeCandidateIncrementsTermAndVotesForSelf) {
@@ -31,6 +53,122 @@ TEST_F(RaftVotingTest, BecomeCandidateIncrementsTermAndVotesForSelf) {
   EXPECT_EQ(raft.get_state(), kv::State::Candidate);
   EXPECT_EQ(raft.get_term(), 1);      // Term incremented
   EXPECT_EQ(raft.get_voted_for(), 1); // Voted for self
+}
+
+TEST_F(RaftVotingTest, BecomeFollowerNeverMovesTermBackward) {
+  kv::Raft raft(config);
+  raft.become_candidate();
+  ASSERT_EQ(raft.get_term(), 1u);
+
+  raft.become_follower(0, 2);
+
+  EXPECT_EQ(raft.get_term(), 1u);
+  EXPECT_EQ(raft.get_state(), kv::State::Candidate);
+}
+
+TEST_F(RaftVotingTest, RejectsInvalidTimingConfiguration) {
+  config.election_tick = 0;
+  EXPECT_THROW(kv::Raft raft(config), std::invalid_argument);
+}
+
+TEST_F(RaftVotingTest, RejectsDuplicateClusterMembers) {
+  config.peers = {1, 2, 2};
+  EXPECT_THROW(kv::Raft raft(config), std::invalid_argument);
+}
+
+TEST_F(RaftVotingTest, PreCampaignRequestsTheNextTermWithoutAdvancingLocally) {
+  kv::Raft raft(config);
+  raft.become_pre_candidate();
+  raft.pre_campaign();
+
+  EXPECT_EQ(raft.get_term(), 0u);
+  const auto messages = raft.read_messages();
+  ASSERT_EQ(messages.size(), 2u);
+  for (const auto &message : messages) {
+    EXPECT_EQ(message.type, kv::proto::MsgPreVote);
+    EXPECT_EQ(message.term, 1u);
+  }
+}
+
+TEST_F(RaftVotingTest, RejectsStalePreVote) {
+  config.id = 2;
+  kv::Raft raft(config);
+  raft.become_follower(2, 0);
+
+  kv::proto::Message request;
+  request.type = kv::proto::MsgPreVote;
+  request.from = 1;
+  request.to = 2;
+  request.term = 2;
+  request.last_log_index = 0;
+  request.last_log_term = 0;
+
+  EXPECT_FALSE(raft.handle_pre_vote(request).vote_granted);
+}
+
+TEST_F(RaftVotingTest, HigherTermPreVoteResponseStepsDown) {
+  kv::Raft raft(config);
+  raft.become_candidate();
+  raft.become_pre_candidate();
+
+  kv::proto::Message response;
+  response.type = kv::proto::MsgPreVoteResponse;
+  response.from = 2;
+  response.to = 1;
+  response.term = 2;
+  response.vote_granted = false;
+  raft.handle_pre_vote_response(response);
+
+  EXPECT_EQ(raft.get_state(), kv::State::Follower);
+  EXPECT_EQ(raft.get_term(), 2u);
+}
+
+TEST_F(RaftVotingTest, StalePreVoteResponseDoesNotCountInANewerTerm) {
+  kv::Raft raft(config);
+  raft.become_candidate();
+  raft.become_pre_candidate();
+  raft.pre_campaign();
+  raft.read_messages();
+
+  kv::proto::Message stale;
+  stale.type = kv::proto::MsgPreVoteResponse;
+  stale.from = 2;
+  stale.to = 1;
+  stale.term = 1;
+  stale.pre_vote_term = 1;
+  stale.vote_granted = true;
+  raft.handle_pre_vote_response(stale);
+
+  EXPECT_EQ(raft.get_state(), kv::State::PreCandidate);
+  EXPECT_EQ(raft.get_term(), 1u);
+}
+
+TEST_F(RaftVotingTest, CountsEligiblePreVoteFromALaggingTermPeer) {
+  kv::Raft candidate(config);
+  candidate.become_follower(5, 0);
+  candidate.become_pre_candidate();
+  candidate.pre_campaign();
+  const auto requests = candidate.read_messages();
+  const auto request_it = std::find_if(
+      requests.begin(), requests.end(), [](const auto &message) {
+        return message.to == 3;
+      });
+  ASSERT_NE(request_it, requests.end());
+  const auto request = *request_it;
+  ASSERT_EQ(request.term, 6u);
+
+  config.id = 3;
+  kv::Raft lagging_peer(config);
+  lagging_peer.become_follower(4, 0);
+  const auto response = lagging_peer.handle_pre_vote(request);
+  ASSERT_TRUE(response.vote_granted);
+  ASSERT_EQ(response.term, 4u);
+  ASSERT_EQ(response.pre_vote_term, 6u);
+
+  candidate.handle_pre_vote_response(response);
+
+  EXPECT_EQ(candidate.get_state(), kv::State::Candidate);
+  EXPECT_EQ(candidate.get_term(), 6u);
 }
 
 // Test: Campaign generates correct RequestVote messages
@@ -156,6 +294,80 @@ TEST_F(RaftVotingTest, HandleRequestVoteRejectsSecondRequesterInSameTerm) {
   EXPECT_EQ(raft.get_voted_for(), 1);   // Still voted for node 1
 }
 
+TEST_F(RaftVotingTest, HandleRequestVoteRejectsCandidateWithStaleLogTerm) {
+  config.id = 2;
+  kv::Raft raft(config);
+
+  kv::proto::Entry local_entry;
+  local_entry.index = 1;
+  local_entry.term = 2;
+  raft.test_append_log_entry(local_entry);
+
+  kv::proto::Message request;
+  request.type = kv::proto::MsgRequestVote;
+  request.from = 1;
+  request.to = 2;
+  request.term = 3;
+  request.last_log_index = 10;
+  request.last_log_term = 1;
+
+  const auto response = raft.handle_request_vote(request);
+
+  EXPECT_EQ(response.term, 3u);
+  EXPECT_FALSE(response.vote_granted);
+  EXPECT_EQ(raft.get_voted_for(), 0u);
+}
+
+TEST_F(RaftVotingTest, HandleRequestVoteRejectsShorterLogInSameTerm) {
+  config.id = 2;
+  kv::Raft raft(config);
+
+  for (uint64_t index = 1; index <= 2; ++index) {
+    kv::proto::Entry entry;
+    entry.index = index;
+    entry.term = 2;
+    raft.test_append_log_entry(entry);
+  }
+
+  kv::proto::Message request;
+  request.type = kv::proto::MsgRequestVote;
+  request.from = 1;
+  request.to = 2;
+  request.term = 3;
+  request.last_log_index = 1;
+  request.last_log_term = 2;
+
+  const auto response = raft.handle_request_vote(request);
+
+  EXPECT_FALSE(response.vote_granted);
+  EXPECT_EQ(raft.get_voted_for(), 0u);
+}
+
+TEST_F(RaftVotingTest, HandleRequestVoteGrantsCandidateWithNewerLogTerm) {
+  config.id = 2;
+  kv::Raft raft(config);
+
+  for (uint64_t index = 1; index <= 3; ++index) {
+    kv::proto::Entry entry;
+    entry.index = index;
+    entry.term = 1;
+    raft.test_append_log_entry(entry);
+  }
+
+  kv::proto::Message request;
+  request.type = kv::proto::MsgRequestVote;
+  request.from = 1;
+  request.to = 2;
+  request.term = 3;
+  request.last_log_index = 1;
+  request.last_log_term = 2;
+
+  const auto response = raft.handle_request_vote(request);
+
+  EXPECT_TRUE(response.vote_granted);
+  EXPECT_EQ(raft.get_voted_for(), 1u);
+}
+
 // Test: Handle RequestVote - idempotent (same requester can ask again)
 TEST_F(RaftVotingTest, HandleRequestVoteIsIdempotent) {
   config.id = 2;
@@ -230,6 +442,116 @@ TEST_F(RaftVotingTest, CandidateBecomesLeaderWithMajorityVotes) {
 
   // Now have 2/3 votes - should become leader (majority!)
   EXPECT_EQ(raft.get_state(), kv::State::Leader);
+}
+
+TEST_F(RaftVotingTest, DuplicateVoteResponseCannotFabricateAQuorum) {
+  kv::Raft raft(config);
+  raft.become_candidate();
+
+  kv::proto::Message granted;
+  granted.type = kv::proto::MsgRequestVoteResponse;
+  granted.from = 2;
+  granted.to = 1;
+  granted.term = raft.get_term();
+  granted.vote_granted = true;
+
+  raft.handle_request_vote_response(granted);
+  ASSERT_EQ(raft.get_state(), kv::State::Candidate);
+
+  raft.handle_request_vote_response(granted);
+
+  EXPECT_EQ(raft.get_state(), kv::State::Candidate);
+  ASSERT_EQ(raft.get_votes().size(), 1u);
+  EXPECT_TRUE(raft.get_votes().at(2));
+}
+
+TEST_F(RaftVotingTest, StaleVoteResponseCannotElectANewerTermCandidate) {
+  kv::Raft raft(config);
+  raft.become_candidate();
+  raft.campaign();
+  raft.read_messages();
+  const auto stale_term = raft.get_term();
+
+  raft.become_candidate();
+  raft.campaign();
+  raft.read_messages();
+  ASSERT_GT(raft.get_term(), stale_term);
+
+  kv::proto::Message stale_vote;
+  stale_vote.type = kv::proto::MsgRequestVoteResponse;
+  stale_vote.from = 2;
+  stale_vote.to = 1;
+  stale_vote.term = stale_term;
+  stale_vote.vote_granted = true;
+  raft.handle_request_vote_response(stale_vote);
+
+  EXPECT_EQ(raft.get_state(), kv::State::Candidate);
+  ASSERT_EQ(raft.get_votes().size(), 1u);
+  EXPECT_TRUE(raft.get_votes().at(1));
+}
+
+TEST_F(RaftVotingTest, DelayedHigherTermVoteResponseStepsDownANewLeader) {
+  kv::Raft raft(config);
+  raft.become_candidate();
+  raft.campaign();
+  raft.read_messages();
+
+  kv::proto::Message granted;
+  granted.type = kv::proto::MsgRequestVoteResponse;
+  granted.from = 2;
+  granted.to = 1;
+  granted.term = 1;
+  granted.vote_granted = true;
+  raft.handle_request_vote_response(granted);
+  ASSERT_EQ(raft.get_state(), kv::State::Leader);
+
+  kv::proto::Message delayed_rejection;
+  delayed_rejection.type = kv::proto::MsgRequestVoteResponse;
+  delayed_rejection.from = 3;
+  delayed_rejection.to = 1;
+  delayed_rejection.term = 2;
+  delayed_rejection.vote_granted = false;
+  raft.handle_request_vote_response(delayed_rejection);
+
+  EXPECT_EQ(raft.get_state(), kv::State::Follower);
+  EXPECT_EQ(raft.get_term(), 2u);
+}
+
+TEST_F(RaftVotingTest, CandidateIgnoresVoteFromOutsideStaticCluster) {
+  kv::Raft raft(config);
+  raft.become_candidate();
+  raft.campaign();
+  raft.read_messages();
+
+  kv::proto::Message forged_vote;
+  forged_vote.type = kv::proto::MsgRequestVoteResponse;
+  forged_vote.from = 99;
+  forged_vote.to = 1;
+  forged_vote.term = 100;
+  forged_vote.vote_granted = true;
+  raft.handle_request_vote_response(forged_vote);
+
+  EXPECT_EQ(raft.get_state(), kv::State::Candidate);
+  EXPECT_EQ(raft.get_term(), 1u);
+}
+
+TEST_F(RaftVotingTest, FollowerRejectsVoteRequestFromOutsideStaticCluster) {
+  config.id = 2;
+  kv::Raft raft(config);
+
+  kv::proto::Message request;
+  request.type = kv::proto::MsgRequestVote;
+  request.from = 99;
+  request.to = 2;
+  request.term = 100;
+  request.last_log_index = 0;
+  request.last_log_term = 0;
+
+  const auto response = raft.handle_request_vote(request);
+
+  EXPECT_FALSE(response.vote_granted);
+  EXPECT_EQ(response.term, 0u);
+  EXPECT_EQ(raft.get_term(), 0u);
 }
 
 // Test: Leader broadcasts heartbeat messages

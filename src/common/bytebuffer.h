@@ -1,41 +1,45 @@
 #pragma once
-#include <cassert>
+
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
 namespace kv {
 
-// ByteBuffer: Growing buffer with read/write pointers
-// Avoids O(N) erase by tracking reader position
+// A bounded byte accumulator. Consumed bytes are never exposed again, and
+// appends are rejected before the configured readable-byte limit is exceeded.
 class ByteBuffer {
 public:
-  ByteBuffer();
+  static constexpr std::size_t kDefaultLimit =
+      64U * 1024U * 1024U + 5U;
 
-  // Append data to buffer (grows if needed)
-  void put(const uint8_t *data, uint32_t len);
+  explicit ByteBuffer(std::size_t max_size = kDefaultLimit);
 
-  // Mark data as consumed/read
-  void read_bytes(uint32_t len);
+  void append(const std::uint8_t *bytes, std::size_t size);
+  void append(const void *bytes, std::size_t size);
+  void consume(std::size_t size);
+  void clear() noexcept;
 
-  // Gets pointer to start of unread data
-  const uint8_t *reader() const;
+  const std::uint8_t *data() const noexcept;
+  std::uint8_t *data() noexcept;
+  std::size_t readable_bytes() const noexcept;
+  std::size_t size() const noexcept { return readable_bytes(); }
+  bool empty() const noexcept { return readable_bytes() == 0; }
+  std::size_t max_size() const noexcept { return max_size_; }
 
-  // Check if there's data to read
-  bool readable() const;
-
-  // How many bytes available to read
-  uint32_t readable_bytes() const;
-
-  // Full reset to initial state
-  void reset();
+  // Compatibility names used by the original public transport boundary.
+  void put(const std::uint8_t *bytes, std::size_t size) { append(bytes, size); }
+  std::size_t readable() const noexcept { return readable_bytes(); }
+  const std::uint8_t *reader() const noexcept { return data(); }
+  std::uint8_t *reader() noexcept { return data(); }
+  void read_bytes(std::size_t size) { consume(size); }
 
 private:
-  // Reset pointers to 0 when buffer fully consumed
-  void may_shrink_to_fit();
+  void compact();
 
-  uint32_t reader_;
-  uint32_t writer_;
-  std::vector<uint8_t> buff_;
+  std::vector<std::uint8_t> bytes_;
+  std::size_t read_offset_ = 0;
+  std::size_t max_size_;
 };
 
 } // namespace kv
