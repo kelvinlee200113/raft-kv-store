@@ -21,3 +21,10 @@ raft-server
 
 # Debug files
 *.dSYM/
+
+# Python helper artifacts
+__pycache__/
+*.py[cod]
+
+# Local planning artifacts
+.scratch/

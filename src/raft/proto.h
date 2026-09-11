@@ -62,16 +62,26 @@ struct Message {
   uint64_t snapshot_term;  // Term of snapshot_index
   std::vector<uint8_t> snapshot_data; // Serialized state machine state
 
+  // ReadIndex context. Leaders attach a nonzero context to a heartbeat round;
+  // followers echo it in the corresponding AppendEntries response.
+  uint64_t read_context;
+
+  // Prospective term echoed by PreVote responses. `term` remains the
+  // responder's actual current term so a higher-term response can still make
+  // the requester step down.
+  uint64_t pre_vote_term;
+
   Message()
       : type(MsgRequestVote), from(0), to(0), term(0), last_log_index(0),
         last_log_term(0), vote_granted(false), prev_log_index(0),
         prev_log_term(0), leader_commit(0), success(false), match_index(0),
-        snapshot_index(0), snapshot_term(0) {}
+        snapshot_index(0), snapshot_term(0), read_context(0),
+        pre_vote_term(0) {}
 
   MSGPACK_DEFINE(type, from, to, term, last_log_index, last_log_term,
                  vote_granted, prev_log_index, prev_log_term, entries,
                  leader_commit, success, match_index, snapshot_index,
-                 snapshot_term, snapshot_data);
+                 snapshot_term, snapshot_data, read_context, pre_vote_term);
 };
 
 typedef std::shared_ptr<Message> MessagePtr;

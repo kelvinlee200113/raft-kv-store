@@ -1,31 +1,39 @@
 #pragma once
-#include <boost/asio.hpp>
-#include <memory>
+
+#include <boost/asio/io_context.hpp>
 #include <raft/proto.h>
+
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
 
 namespace kv {
 
-// Forward declaration
-class Raft;
-
-// Server listens for incoming TCP connections and creates ServerSession
-// instances to handle them
 class Server {
 public:
-  virtual ~Server() = default;
+  using MessageHandler = std::function<void(proto::Message)>;
 
-  // Start accepting connections
-  virtual void start() = 0;
+  static std::shared_ptr<Server> create(boost::asio::io_context &io_context,
+                                        const std::string &address,
+                                        MessageHandler handler);
 
-  // Stop the server
-  virtual void stop() = 0;
+  ~Server();
 
-  // Factory method
-  static std::shared_ptr<Server> create(boost::asio::io_context &io_ctx,
-                                        const std::string &host,
-                                        Raft* raft);
+  Server(const Server &) = delete;
+  Server &operator=(const Server &) = delete;
+
+  void start();
+  void stop();
+  std::uint16_t local_port() const;
+
+private:
+  struct Impl;
+  explicit Server(std::shared_ptr<Impl> impl);
+
+  std::shared_ptr<Impl> impl_;
 };
 
-typedef std::shared_ptr<Server> ServerPtr;
+using ServerPtr = std::shared_ptr<Server>;
 
 } // namespace kv

@@ -1,253 +1,301 @@
-#include <boost/asio.hpp>
-#include <iostream>
-#include <msgpack.hpp>
-#include <raft/raft.h>
-#include <transport/proto.h>
 #include <transport/server.h>
 
+#include <raft/proto.h>
+#include <transport/proto.h>
+
+#include <boost/asio.hpp>
+#include <msgpack.hpp>
+
+#include <array>
+#include <atomic>
+#include <stdexcept>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
 namespace kv {
+namespace {
 
-// Forward declaration
-class ServerImpl;
+struct AddressParts {
+  std::string host;
+  std::string service;
+};
 
-// ServerSession manages ONE incoming TCP connection from a remote peer
-// Uses std::enable_shared_from_this to safely capture 'this' in async
-// callbacks
-class ServerSession : public std::enable_shared_from_this<ServerSession> {
-public:
-  ServerSession(boost::asio::io_context &io_ctx, Raft* raft)
-      : socket_(io_ctx), raft_(raft) {}
-
-  ~ServerSession() {}
-
-  // Start reading TransportMeta header (5 bytes: type + length)
-  void start_read_meta() {
-    auto self = shared_from_this(); // Keep session alive during async operation
-    auto buffer = boost::asio::buffer(&meta_, sizeof(meta_));
-    auto handler = [self](const boost::system::error_code &error,
-                          std::size_t bytes) {
-      if (error || bytes == 0) {
-        std::cerr << "Read meta error: " << error.message() << std::endl;
-        return;
-      }
-
-      if (bytes != sizeof(TransportMeta)) {
-        std::cerr << "Invalid meta size: " << bytes << std::endl;
-        return;
-      }
-
-      self->start_read_message();
-    };
-
-    // Read exactly 5 bytes (TransportMeta)
-    boost::asio::async_read(socket_, buffer,
-                            boost::asio::transfer_exactly(sizeof(meta_)),
-                            handler);
+AddressParts split_address(const std::string &address) {
+  if (address.empty()) {
+    throw std::invalid_argument("server address is empty");
   }
 
-  // Read message payload based on length from meta_
-  void start_read_message() {
-    uint32_t len = ntohl(meta_.len); // Convert from network byte order
+  if (address.front() == '[') {
+    const auto bracket = address.find(']');
+    if (bracket == std::string::npos || bracket + 1 >= address.size() ||
+        address[bracket + 1] != ':') {
+      throw std::invalid_argument("invalid bracketed server address");
+    }
+    const auto host = address.substr(1, bracket - 1);
+    const auto service = address.substr(bracket + 2);
+    if (host.empty() || service.empty()) {
+      throw std::invalid_argument("server address requires host and port");
+    }
+    return {host, service};
+  }
 
-    // Resize buffer if needed
-    if (buffer_.capacity() < len) {
-      buffer_.resize(len);
+  const auto separator = address.rfind(':');
+  if (separator == std::string::npos || separator == 0 ||
+      separator + 1 == address.size()) {
+    throw std::invalid_argument("server address must be host:port");
+  }
+  return {address.substr(0, separator), address.substr(separator + 1)};
+}
+
+} // namespace
+
+struct Server::Impl : std::enable_shared_from_this<Server::Impl> {
+  using Tcp = boost::asio::ip::tcp;
+  using Strand = boost::asio::strand<boost::asio::io_context::executor_type>;
+
+  struct Connection : std::enable_shared_from_this<Connection> {
+    Connection(Tcp::socket accepted_socket, std::weak_ptr<Impl> owner,
+               Strand strand)
+        : socket(std::move(accepted_socket)), owner(std::move(owner)),
+          strand(std::move(strand)) {}
+
+    void start() { read_header(); }
+
+    void stop() {
+      if (stopped) {
+        return;
+      }
+      stopped = true;
+      boost::system::error_code ignored;
+      socket.cancel(ignored);
+      socket.shutdown(Tcp::socket::shutdown_both, ignored);
+      socket.close(ignored);
     }
 
-    auto self = shared_from_this();
-    auto buffer = boost::asio::buffer(buffer_.data(), len);
-    auto handler = [self, len](const boost::system::error_code &error,
-                               std::size_t bytes) {
-      if (error || bytes == 0) {
-        std::cerr << "Read message error: " << error.message() << std::endl;
+    void read_header() {
+      if (stopped) {
         return;
       }
 
-      if (bytes != len) {
-        std::cerr << "Invalid message size: " << bytes << " expected: " << len
-                  << std::endl;
+      auto self = shared_from_this();
+      boost::asio::async_read(
+          socket, boost::asio::buffer(header_bytes),
+          boost::asio::bind_executor(
+              strand, [self](const boost::system::error_code &error,
+                             std::size_t) {
+                if (error) {
+                  self->finish();
+                  return;
+                }
+
+                try {
+                  const auto header = transport::decode_header(
+                      self->header_bytes.data(), self->header_bytes.size());
+                  self->payload.resize(header.payload_size);
+                } catch (const std::exception &) {
+                  self->finish();
+                  return;
+                }
+                self->read_payload();
+              }));
+    }
+
+    void read_payload() {
+      if (payload.empty()) {
+        decode_and_dispatch();
         return;
       }
 
-      self->decode_message(len);
-    };
+      auto self = shared_from_this();
+      boost::asio::async_read(
+          socket, boost::asio::buffer(payload),
+          boost::asio::bind_executor(
+              strand, [self](const boost::system::error_code &error,
+                             std::size_t) {
+                if (error) {
+                  self->finish();
+                  return;
+                }
+                self->decode_and_dispatch();
+              }));
+    }
 
-    // Read exactly 'len' bytes
-    boost::asio::async_read(socket_, buffer,
-                            boost::asio::transfer_exactly(len), handler);
-  }
-
-  // Decode received message and continue reading
-  void decode_message(uint32_t len) {
-    switch (meta_.type) {
-    case TransportTypeStream: {
-      // Deserialize msgpack binary to Message struct
-      proto::MessagePtr msg(new proto::Message());
+    void decode_and_dispatch() {
       try {
-        msgpack::object_handle oh =
-            msgpack::unpack((const char *)buffer_.data(), len);
-        oh.get().convert(*msg);
-      } catch (std::exception &e) {
-        std::cerr << "Msgpack decode error: " << e.what() << std::endl;
+        const auto object = msgpack::unpack(
+            reinterpret_cast<const char *>(payload.data()), payload.size());
+        proto::Message message;
+        object.get().convert(message);
+
+        const auto server = owner.lock();
+        if (!server || !server->dispatch(std::move(message))) {
+          finish();
+          return;
+        }
+      } catch (const std::exception &) {
+        finish();
         return;
       }
 
-      // Route message to Raft based on type
-      switch (msg->type) {
-      case proto::MsgRequestVote:
-        std::cout << "Received RequestVote from " << msg->from
-                  << " term=" << msg->term << std::endl;
-        {
-          proto::Message response = raft_->handle_request_vote(*msg);
-          raft_->send(response); // Queue response to be sent
-        }
-        break;
-
-      case proto::MsgAppendEntries:
-        std::cout << "Received AppendEntries from " << msg->from
-                  << " term=" << msg->term << " entries=" << msg->entries.size()
-                  << std::endl;
-        {
-          proto::Message response = raft_->handle_append_entries(*msg);
-          raft_->send(response); // Queue response to be sent
-        }
-        break;
-
-      case proto::MsgPreVote:
-        std::cout << "Received PreVote from " << msg->from
-                  << " term=" << msg->term << std::endl;
-        {
-          proto::Message response = raft_->handle_pre_vote(*msg);
-          raft_->send(response); // Queue response to be sent
-        }
-        break;
-
-      case proto::MsgPreVoteResponse:
-        std::cout << "Received PreVoteResponse from " << msg->from
-                  << " granted=" << msg->vote_granted << std::endl;
-        raft_->handle_pre_vote_response(*msg);
-        break;
-
-      case proto::MsgRequestVoteResponse:
-        std::cout << "Received RequestVoteResponse from " << msg->from
-                  << " granted=" << msg->vote_granted << std::endl;
-        raft_->handle_request_vote_response(*msg);
-        break;
-
-      case proto::MsgAppendEntriesResponse:
-        std::cout << "Received AppendEntriesResponse from " << msg->from
-                  << " success=" << msg->success << std::endl;
-        raft_->handle_append_entries_response(*msg);
-        break;
-
-      case proto::MsgInstallSnapshot:
-        std::cout << "Received InstallSnapshot from " << msg->from
-                  << " index=" << msg->snapshot_index << std::endl;
-        {
-          proto::Message response = raft_->handle_install_snapshot(*msg);
-          raft_->send(response); // Queue response to be sent
-        }
-        break;
-
-      case proto::MsgInstallSnapshotResponse:
-        std::cout << "Received InstallSnapshotResponse from " << msg->from
-                  << " success=" << msg->success << std::endl;
-        raft_->handle_install_snapshot_response(*msg);
-        break;
-
-      default:
-        std::cerr << "Unknown message type: " << (int)msg->type << std::endl;
-        break;
-      }
-      break;
+      read_header();
     }
-    default:
-      std::cerr << "Unknown transport type: " << (int)meta_.type << std::endl;
+
+    void finish() {
+      if (stopped) {
+        return;
+      }
+      stop();
+      if (const auto server = owner.lock()) {
+        server->remove_connection(shared_from_this());
+      }
+    }
+
+    Tcp::socket socket;
+    std::weak_ptr<Impl> owner;
+    Strand strand;
+    std::array<std::uint8_t, transport::kHeaderSize> header_bytes{};
+    std::vector<std::uint8_t> payload;
+    bool stopped = false;
+  };
+
+  Impl(boost::asio::io_context &io_context, const std::string &address,
+       Server::MessageHandler message_handler)
+      : strand(boost::asio::make_strand(io_context)), acceptor(strand),
+        handler(std::move(message_handler)) {
+    if (!handler) {
+      throw std::invalid_argument("transport server requires a message handler");
+    }
+
+    const auto parts = split_address(address);
+    Tcp::resolver resolver(io_context);
+    const auto endpoints = resolver.resolve(
+        parts.host, parts.service, Tcp::resolver::passive);
+    if (endpoints.empty()) {
+      throw std::invalid_argument("server address did not resolve");
+    }
+
+    const auto endpoint = endpoints.begin()->endpoint();
+    acceptor.open(endpoint.protocol());
+    acceptor.set_option(Tcp::acceptor::reuse_address(true));
+    acceptor.bind(endpoint);
+    acceptor.listen();
+  }
+
+  void request_start() {
+    auto self = shared_from_this();
+    boost::asio::dispatch(strand, [self]() {
+      if (self->started || self->stop_requested.load(std::memory_order_acquire)) {
+        return;
+      }
+      self->started = true;
+      self->accept_next();
+    });
+  }
+
+  void request_stop() {
+    bool expected = false;
+    if (!stop_requested.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
       return;
     }
 
-    // Continue reading next message
-    start_read_meta();
+    auto self = shared_from_this();
+    boost::asio::post(strand, [self]() { self->stop_now(); });
   }
 
-  boost::asio::ip::tcp::socket socket_; // Public for acceptor
+  std::uint16_t local_port() const {
+    boost::system::error_code error;
+    const auto endpoint = acceptor.local_endpoint(error);
+    if (error) {
+      throw boost::system::system_error(error);
+    }
+    return endpoint.port();
+  }
 
-private:
-  Raft* raft_;
-  TransportMeta meta_;
-  std::vector<uint8_t> buffer_;
-};
-
-typedef std::shared_ptr<ServerSession> ServerSessionPtr;
-
-// ServerImpl implements the Server interface
-class ServerImpl : public Server {
-public:
-  ServerImpl(boost::asio::io_context &io_ctx, const std::string &host, Raft* raft)
-      : io_ctx_(io_ctx), acceptor_(io_ctx), raft_(raft) {
-
-    // Parse "127.0.0.1:5001" into IP and port
-    size_t colon_pos = host.find(':');
-    if (colon_pos == std::string::npos) {
-      std::cerr << "Invalid host format: " << host << std::endl;
-      exit(1);
+  void accept_next() {
+    if (stop_requested.load(std::memory_order_acquire)) {
+      return;
     }
 
-    std::string ip = host.substr(0, colon_pos);
-    std::string port_str = host.substr(colon_pos + 1);
-    int port = std::stoi(port_str);
+    auto self = shared_from_this();
+    acceptor.async_accept(
+        boost::asio::bind_executor(
+            strand,
+            [self](const boost::system::error_code &error, Tcp::socket socket) {
+              if (!error &&
+                  !self->stop_requested.load(std::memory_order_acquire)) {
+                auto connection = std::make_shared<Connection>(
+                    std::move(socket), self, self->strand);
+                self->connections.insert(connection);
+                connection->start();
+              }
 
-    // Create endpoint
-    auto address = boost::asio::ip::make_address(ip);
-    auto endpoint = boost::asio::ip::tcp::endpoint(address, port);
-
-    // Setup acceptor
-    acceptor_.open(endpoint.protocol());
-    acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
-    acceptor_.bind(endpoint);
-    acceptor_.listen();
-
-    std::cout << "Server listening on " << ip << ":" << port << std::endl;
+              if (!self->stop_requested.load(std::memory_order_acquire)) {
+                self->accept_next();
+              }
+            }));
   }
 
-  ~ServerImpl() override {}
-
-  void start() override {
-    // Create new session for incoming connection
-    ServerSessionPtr session = std::make_shared<ServerSession>(io_ctx_, raft_);
-
-    // Async accept - callback fires when client connects
-    acceptor_.async_accept(
-        session->socket_, [this, session](const boost::system::error_code &error) {
-          if (error) {
-            std::cerr << "Accept error: " << error.message() << std::endl;
-            return;
-          }
-
-          std::cout << "Accepted connection" << std::endl;
-
-          // Start reading from this session
-          session->start_read_meta();
-
-          // Accept next connection (recursive)
-          this->start();
-        });
+  bool dispatch(proto::Message message) {
+    switch (message.type) {
+    case proto::MsgRequestVote:
+    case proto::MsgRequestVoteResponse:
+    case proto::MsgAppendEntries:
+    case proto::MsgAppendEntriesResponse:
+    case proto::MsgPreVote:
+    case proto::MsgPreVoteResponse:
+    case proto::MsgInstallSnapshot:
+    case proto::MsgInstallSnapshotResponse:
+      handler(std::move(message));
+      return true;
+    default:
+      return false;
+    }
   }
 
-  void stop() override {
-    // TODO: Implement
+  void remove_connection(const std::shared_ptr<Connection> &connection) {
+    connections.erase(connection);
   }
 
-private:
-  boost::asio::io_context &io_ctx_;
-  boost::asio::ip::tcp::acceptor acceptor_;
-  Raft* raft_;
+  void stop_now() {
+    boost::system::error_code ignored;
+    acceptor.cancel(ignored);
+    acceptor.close(ignored);
+    for (const auto &connection : connections) {
+      connection->stop();
+    }
+    connections.clear();
+  }
+
+  Strand strand;
+  Tcp::acceptor acceptor;
+  Server::MessageHandler handler;
+  std::unordered_set<std::shared_ptr<Connection>> connections;
+  std::atomic<bool> stop_requested{false};
+  bool started = false;
 };
 
-std::shared_ptr<Server> Server::create(boost::asio::io_context &io_ctx,
-                                       const std::string &host,
-                                       Raft* raft) {
-  return std::make_shared<ServerImpl>(io_ctx, host, raft);
+Server::Server(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {}
+
+Server::~Server() { stop(); }
+
+std::shared_ptr<Server> Server::create(boost::asio::io_context &io_context,
+                                       const std::string &address,
+                                       MessageHandler handler) {
+  return std::shared_ptr<Server>(
+      new Server(std::make_shared<Impl>(io_context, address,
+                                        std::move(handler))));
 }
+
+void Server::start() { impl_->request_start(); }
+
+void Server::stop() {
+  if (impl_) {
+    impl_->request_stop();
+  }
+}
+
+std::uint16_t Server::local_port() const { return impl_->local_port(); }
 
 } // namespace kv
