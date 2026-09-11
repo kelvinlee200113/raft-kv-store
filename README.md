@@ -1,185 +1,137 @@
 # Raft KV
 
-Raft KV is a C++20 replicated key-value store built around one fixed three-node Raft group. It exposes `PING`, `GET`, `SET`, and `DEL` through RESP2 over Boost.Asio.
+A C++20 replicated key-value store that keeps one ordered history across three
+processes. It combines Raft consensus, durable writes, quorum-confirmed reads,
+and crash recovery behind a small RESP2 interface.
 
-The project is intentionally scoped to member IDs `{1,2,3}`, static membership, and one Raft group. It is not a Redis-compatible production service.
+The project focuses on the boundaries between **replication, persistence, and
+state-machine application**: when an operation can return success, what survives
+a restart, and what happens when a majority is unavailable.
 
-## Core guarantees
+[Architecture](docs/architecture.md) · [Design decisions](docs/design-decisions.md) ·
+[Demo](docs/demo.md) · [Validation](VALIDATION.md) · [Code map](docs/README.md)
 
-- Randomized leader election with PreVote and one vote per term.
-- Current-term quorum commit with ordered state-machine application.
-- Leader-only linearizable reads through quorum-confirmed ReadIndex rounds.
-- CRC-checked WAL recovery with damaged-tail truncation and startup failure when repair fails or recovered commit metadata cannot be satisfied.
-- Whole-state snapshots, InstallSnapshot catch-up, and in-memory log compaction.
-- Consensus-backed operations return success only after two-node quorum confirmation.
+## Architecture
 
-## Architecture and invariants
+Each node has three single-owner Boost.Asio event loops. The Raft loop owns
+consensus and the write-ahead log (WAL); the client loop owns the key-value state;
+the peer loop owns inter-node TCP connections. Cross-loop work is posted as messages.
 
-Each node runs three single-owner Boost.Asio event loops:
+```mermaid
+flowchart TB
+    C["RESP2 client"] <-->|"PING / GET / SET / DEL"| K
+    subgraph N["One node - three event loops"]
+        K["Client / KV loop
+Sessions and state machine"]
+        R["Raft / WAL loop
+Election, log, commit index"]
+        P["Peer loop
+TCP framing and outbound queues"]
+        K -->|"Proposal or ReadIndex"| R
+        R -->|"One committed entry"| K
+        K -->|"Applied index"| R
+        R <-->|"Raft messages"| P
+    end
+    R -->|"Append and fsync"| W[("Local WAL
+Entries, hard state, snapshots")]
+    P <-->|"Raft RPCs over TCP"| F["Other two nodes
+Same architecture"]
+```
 
-| Event loop | Owns |
+A write returns success after durable majority replication and local application.
+A `GET` completes a ReadIndex round and waits for the local state machine to reach
+the safe index. `PING` is a local health check and does not establish quorum health.
+
+See the [write/read sequences and recovery path](docs/architecture.md) for the
+ordering rules behind these statements.
+
+## What it implements
+
+| Area | Mechanism |
 | --- | --- |
-| Raft | Consensus state, timers, and WAL access |
-| Peer | Raft TCP listeners, connections, and outbound queues |
-| Client/KV | RESP sessions, pending requests, and the key-value state machine |
+| Consensus | Randomized elections, PreVote, one vote per term, conflict repair, and current-term quorum commit. |
+| Application | One committed entry in flight; the KV loop acknowledges its applied index before the next entry is dispatched. |
+| Reads | Leader-only ReadIndex with round identifiers, current-term confirmation, and an applied-index barrier. |
+| Persistence | CRC-checked WAL records, flush-before-ack ordering, damaged-tail repair, and validation of recovered committed state. |
+| Recovery | Whole-state snapshots, in-memory log compaction, InstallSnapshot catch-up, and committed-suffix replay. |
+| Client and peer I/O | Incremental RESP2 decoding, ordered replies per session, framed MessagePack peer messages, and bounded peer queues. |
 
-Committed entries cross from Raft to KV one at a time. The KV loop posts the applied index back before Raft dispatches the next entry; unapplied work remains in the Raft log.
+The runtime uses exactly one Raft group with static member IDs `{1,2,3}`. Two
+communicating, healthy nodes can make progress; a lone node cannot successfully
+complete a new quorum-backed operation.
 
-```mermaid
-flowchart LR
-    Client["RESP client"] --> ClientLoop["Client + KV loop"]
-    ClientLoop -->|"proposal / ReadIndex"| RaftLoop["Raft + WAL loop"]
-    RaftLoop -->|"one committed entry"| ClientLoop
-    ClientLoop -->|"applied index"| RaftLoop
-    RaftLoop -->|"outbound RPC"| PeerLoop["Peer network loop"]
-    PeerLoop -->|"inbound RPC"| RaftLoop
-    RaftLoop --> WAL["CRC-protected WAL"]
-    ClientLoop --> Snapshot["KV snapshot"]
-    Snapshot --> RaftLoop
-```
+## Build and verify
 
-The ownership model avoids a global application mutex. Writes reply only after application, and reads wait until the local state machine reaches the ReadIndex safe index.
+Requires CMake 3.20+, a C++20 compiler, Boost.System, msgpack-cxx, GoogleTest,
+Bash, and Python 3. Linux is exercised by [GitHub Actions](https://github.com/kelvinlee200113/raft-kv-store/actions/workflows/ci.yml);
+local validation also runs on macOS.
 
-### Committed write sequence
+Ubuntu dependencies:
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Client
-    participant S as Client/KV loop
-    participant R as Raft/WAL loop
-    participant W as Leader WAL
-    participant P as Peer loop
-    participant F as Follower Raft/WAL
-    C->>S: SET or DEL
-    S->>R: Post proposal
-    R->>W: Append entry and fsync
-    W-->>R: Durable
-    R->>P: Enqueue AppendEntries
-    P->>F: Send RPC
-    F-->>P: Durable replication acknowledgement
-    P-->>R: Post response
-    R->>W: Persist commit index and fsync
-    W-->>R: Durable commit
-    R->>S: Post one committed entry
-    S->>S: Apply to KV state
-    S-->>C: OK or delete count
-    S-->>R: Post applied index
-    R->>R: Advance and dispatch next entry
-```
-
-## Build and test
-
-Requirements:
-
-- CMake 3.20 or newer and a C++20 compiler
-- Boost headers and Boost.System
-- msgpack-cxx and GoogleTest
-- Python 3 for the client and process workflow
-
-Ubuntu dependency example (verify `cmake --version` reports 3.20 or newer):
-
-```bash
+```sh
 sudo apt-get install build-essential cmake libboost-dev libboost-system-dev libmsgpack-cxx-dev libgtest-dev python3
 ```
 
-Build and run the test suite:
+From the repository root:
 
-```bash
+```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
-ctest --test-dir build --output-on-failure --no-tests=error
-```
-
-See [`VALIDATION.md`](VALIDATION.md) for sanitizer and source-coverage commands and the latest local verification receipt.
-
-## End-to-end validation
-
-Run the three-process workflow after building:
-
-```bash
+ctest --test-dir build --output-on-failure --timeout 60 --no-tests=error
 ./scripts/validate_cluster.sh
 ```
 
-The workflow uses isolated temporary data directories and dynamically selected localhost ports. It verifies:
+The last command starts three local processes in temporary directories, writes
+and reads data, kills the elected leader, verifies failover, restarts the cluster,
+and checks that reads and writes fail safely without a majority. It cleans up its
+own processes and data on exit. Use `KEEP_VALIDATION_DATA=1` to retain the evidence.
 
-1. election and leader-only command routing;
-2. concurrent committed writes and ReadIndex-backed reads;
-3. elected-leader crash, two-node failover, and continued progress;
-4. WAL and snapshot recovery across full-cluster restarts;
-5. durable deletion and safe failure without a majority.
+For a hands-on walkthrough, use the [three-terminal demo](docs/demo.md). For
+sanitizers, coverage, dated results, and test limitations, see [Validation](VALIDATION.md).
 
-Temporary files are removed on exit. Set `KEEP_VALIDATION_DATA=1` to retain node logs and storage, or set `RAFT_KV_BIN=/path/to/raft-kv` to validate another build.
+## Technical decisions and tradeoffs
 
-## Commands
-
-| Command | Behavior | Reply |
+| Decision | Benefit | Cost / boundary |
 | --- | --- | --- |
-| `PING [message]` | Local health check | `PONG` or the supplied message |
-| `SET key value` | Persist, replicate, commit, and apply | `OK` |
-| `GET key` | Complete ReadIndex and wait for local application | value or `(nil)` |
-| `DEL key [key ...]` | Persist, replicate, commit, and apply | number of deleted keys |
+| Three event loops with separate owners | Consensus, sockets, and KV mutations have explicit ownership. | Cross-loop handoffs add scheduling overhead; snapshot installation can block the Raft loop. |
+| Synchronous WAL flushes | Persistence ordering is visible before acknowledgements and successful completion. | Disk stalls delay heartbeats and consensus processing. |
+| Single-flight committed apply | Preserves order and avoids a separate unbounded queue of copied apply work. | Limits apply parallelism; the Raft log and pending requests can still grow. |
+| ReadIndex instead of read leases | Establishes read authority through a quorum round without a clock-based lease. | Requires quorum communication; followers reject reads. |
+| Whole-state snapshots | Simple state capture and lagging-follower catch-up. | Copies the whole KV state, does not reclaim WAL bytes, and must fit one WAL record. |
+| Fixed three-node membership | Keeps election, recovery, and failure behavior small enough to inspect. | No membership changes, sharding, or horizontal partitioning. |
 
-Followers reject `GET`, `SET`, and `DEL` with `NOT_LEADER <id>` or `NOT_LEADER UNKNOWN`. A read quorum timeout returns `TRYAGAIN read quorum unavailable`.
+[Design decisions](docs/design-decisions.md) explains the alternatives, source
+locations, and conditions that would justify revisiting each choice.
 
-A timed-out `SET` or `DEL` returns `TRYAGAIN write outcome unknown` because the entry may commit after the client times out.
+## Command semantics
 
-## Implementation and test map
-
-CI builds a Release configuration on Linux, runs all 11 CTest targets, and executes the three-process validation workflow.
-
-| Property | Implementation | Verification |
+| Command | Success | Failure behavior |
 | --- | --- | --- |
-| Election, PreVote, and quorum commit | `src/raft/` | `tests/voting_test.cpp`, `tests/replication_test.cpp` |
-| Ordered single-flight application | `src/raft/raft.cpp`, `src/app/node_runtime.cpp` | `tests/async_apply_test.cpp`, `scripts/validate_cluster.sh` |
-| Linearizable leader reads | `src/raft/raft.cpp`, `src/app/node_runtime.cpp` | `tests/read_index_test.cpp` |
-| RESP2 protocol and sessions | `src/server/` | `tests/resp_codec_test.cpp`, `tests/resp_server_test.cpp` |
-| Peer transport and bounds | `src/transport/` | `tests/network_test.cpp`, `tests/transport_proto_test.cpp` |
-| WAL recovery | `src/wal/` | `tests/wal_test.cpp` |
-| Snapshots and compaction | `src/raft/`, `src/wal/`, `src/server/kv_store.cpp` | `tests/snapshot_test.cpp`, `scripts/validate_cluster.sh` |
+| `PING [message]` | `PONG` or supplied message | Local only; may succeed without a leader. |
+| `SET key value` | `OK` after commit and apply | Followers return `NOT_LEADER`; a timeout has an unknown write outcome. |
+| `GET key` | Value or `(nil)` after ReadIndex | Followers return `NOT_LEADER`; no read quorum returns `TRYAGAIN`. |
+| `DEL key [key ...]` | Number of deleted keys after commit and apply | Same quorum and timeout rules as `SET`. |
 
-## Run a cluster manually
+`TRYAGAIN write outcome unknown` does **not** mean the write was rolled back. The
+entry may commit later. Request IDs correlate local replies; there is no durable
+client-request deduplication or exactly-once retry contract.
 
-Start each node in a separate terminal. The examples use numeric IPv4 addresses.
+## Scope and limits
 
-```bash
-mkdir -p /tmp/raft-kv/node{1,2,3}
+This is a focused systems project with reproducible correctness checks. It does
+not implement dynamic membership, multi-Raft, transactions, expiration, follower
+reads, authentication, TLS, or full Redis compatibility. There are no measured
+throughput or latency claims.
 
-./build/raft-kv --id=1 --raft=127.0.0.1:9101 --client=127.0.0.1:9201 \
-  --peer=2@127.0.0.1:9102 --peer=3@127.0.0.1:9103 --data=/tmp/raft-kv/node1
+RESP bulk strings are limited to 1 MiB, peer payloads to 64 MiB, and individual
+WAL payloads to less than 16 MiB. In this revision an oversized whole-state
+snapshot can stop the node; use small datasets for the demo. Frame limits do not
+bound total database size or total process memory. See the
+[storage and capacity boundaries](docs/architecture.md#storage-and-capacity-boundaries).
 
-./build/raft-kv --id=2 --raft=127.0.0.1:9102 --client=127.0.0.1:9202 \
-  --peer=1@127.0.0.1:9101 --peer=3@127.0.0.1:9103 --data=/tmp/raft-kv/node2
+## License and acknowledgements
 
-./build/raft-kv --id=3 --raft=127.0.0.1:9103 --client=127.0.0.1:9203 \
-  --peer=1@127.0.0.1:9101 --peer=2@127.0.0.1:9102 --data=/tmp/raft-kv/node3
-```
-
-Use the included RESP client against the elected leader. Replace port `9201` if another node wins the election.
-
-```bash
-python3 scripts/resp_client.py --port 9201 PING
-python3 scripts/resp_client.py --port 9201 SET instrument ES
-python3 scripts/resp_client.py --port 9201 GET instrument
-python3 scripts/resp_client.py --port 9201 DEL instrument
-```
-
-## Scope and tradeoffs
-
-- Exactly three static members in one Raft group.
-- No joint consensus, dynamic membership, sharding, or multi-Raft.
-- Leader-only reads; no follower or lease reads.
-- Synchronous WAL flushes can stall the Raft event loop.
-- Whole-state snapshots without chunked streaming or WAL byte reclamation.
-- RESP bulk strings capped at 1 MiB, peer payloads at 64 MiB, and WAL record payloads below 16 MiB.
-- No transactions, expiration, pub/sub, authentication, TLS, or full Redis compatibility.
-- No durable request deduplication; retries can have an ambiguous outcome.
-- No performance claims without a documented, reproducible benchmark.
-
-## Acknowledgements
-
-Early repository history adapted portions of the transport and write-ahead-log foundations from [`jinyyu/raft-kv`](https://github.com/jinyyu/raft-kv), distributed under the MIT License. The current project substantially redesigns and extends that foundation. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for the retained upstream notice.
-
-## License
-
-This project is distributed under the MIT License. See [`LICENSE`](LICENSE) and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+MIT licensed. Early repository history adapted transport and WAL foundations from
+[`jinyyu/raft-kv`](https://github.com/jinyyu/raft-kv); the current runtime redesigns
+and extends that foundation. See [LICENSE](LICENSE) and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution.
