@@ -131,7 +131,4 @@ bound total database size or total process memory. See the
 
 ## License and acknowledgements
 
-MIT licensed. Early repository history adapted transport and WAL foundations from
-[`jinyyu/raft-kv`](https://github.com/jinyyu/raft-kv); the current runtime redesigns
-and extends that foundation. See [LICENSE](LICENSE) and
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution.
+MIT licensed.
